@@ -61,6 +61,20 @@ func (s *LowestDelay) Now() string {
 	return s.selected[N.NetworkTCP].Tag()
 }
 
+// IsSelected reports whether tag is the current selection for TCP or for UDP. A failure on a tag
+// that is current for UDP alone is still a failure of a server in use, so it must not be dropped
+// just because Now() (which is TCP) names someone else.
+func (s *LowestDelay) IsSelected(tag string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, network := range []string{N.NetworkTCP, N.NetworkUDP} {
+		if cur := s.selected[network]; cur != nil && cur.Tag() == tag {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *LowestDelay) Select(metadata adapter.InboundContext, network string, touch bool) adapter.Outbound {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -163,9 +177,9 @@ func (s *LowestDelay) UpdateOutboundsInfo(history map[string]*adapter.URLTestHis
 		switch {
 		case wasProvisional || !s.healthyLocked(cur.Tag()):
 			if best.Tag() != cur.Tag() {
-				reason := "probe_failed"
+				reason := reasonProbeFailed
 				if wasProvisional {
-					reason = "initial"
+					reason = reasonInitial
 				}
 				s.switchLocked(network, best, reason)
 				changed = true
@@ -178,7 +192,7 @@ func (s *LowestDelay) UpdateOutboundsInfo(history map[string]*adapter.URLTestHis
 		default:
 			curDelay, _ := s.measuredLocked(cur.Tag())
 			if uint32(bestDelay)+uint32(s.cfg.tolerance) < uint32(curDelay) && dwellOK {
-				s.switchLocked(network, best, "better_latency")
+				s.switchLocked(network, best, reasonBetterLatency)
 				changed = true
 			}
 		}

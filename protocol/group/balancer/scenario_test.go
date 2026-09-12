@@ -15,15 +15,15 @@ func TestScenarioDialErrorRecovery(t *testing.T) {
 	f, s, p, _, c := newHarness(t, "a", "b", "c")
 	s.UpdateOutboundsInfo(map[string]*adapter.URLTestHistory{"a": measured(100, c.Now()), "b": measured(150, c.Now()), "c": measured(120, c.Now())})
 	start := c.Now()
-	f.reportFailure("a", "dial_error")
+	f.reportFailure("a", reasonDialError)
 	if s.Now() != "c" {
 		t.Fatalf("expected c (lowest healthy), got %q", s.Now())
 	}
 	// One switch, not two: UDP mirrors TCP and must not be counted a second time.
-	if n := f.counters().Switches["dial_error"]; n != 1 {
+	if n := f.counters().Switches[reasonDialError]; n != 1 {
 		t.Fatalf("one switch expected, got %d", n)
 	}
-	t.Logf("SCENARIO name=dial_error_with_candidates probes=%d switches=%d recovery_ms=%d", len(p.callList()), f.counters().Switches["dial_error"], c.Now().Sub(start).Milliseconds())
+	t.Logf("SCENARIO name=dial_error_with_candidates probes=%d switches=%d recovery_ms=%d", len(p.callList()), f.counters().Switches[reasonDialError], c.Now().Sub(start).Milliseconds())
 }
 
 func TestScenarioAllUnknownRescue(t *testing.T) {
@@ -31,7 +31,7 @@ func TestScenarioAllUnknownRescue(t *testing.T) {
 	s.UpdateOutboundsInfo(map[string]*adapter.URLTestHistory{"a": measured(100, c.Now())})
 	p.set("f", 400)
 	start := c.Now()
-	f.reportFailure("a", "stall")
+	f.reportFailure("a", reasonStall)
 	if !f.waitIdle(3*time.Second) || s.Now() != "f" {
 		t.Fatalf("now=%q", s.Now())
 	}
@@ -39,7 +39,7 @@ func TestScenarioAllUnknownRescue(t *testing.T) {
 	if recovery <= 0 {
 		t.Fatalf("a rescue scan costs probe time, recovery_ms must be positive, got %d", recovery.Milliseconds())
 	}
-	t.Logf("SCENARIO name=rescue_unknown_pool probes=%d switches=%d recovery_ms=%d", len(p.callList()), f.counters().Switches["stall"], recovery.Milliseconds())
+	t.Logf("SCENARIO name=rescue_unknown_pool probes=%d switches=%d recovery_ms=%d", len(p.callList()), f.counters().Switches[reasonStall], recovery.Milliseconds())
 }
 
 func TestScenarioLatencyFlapDoesNotSwitch(t *testing.T) {
@@ -57,7 +57,7 @@ func TestScenarioLatencyFlapDoesNotSwitch(t *testing.T) {
 	if s.Now() != "a" {
 		t.Fatalf("jitter under tolerance must not switch, got %q", s.Now())
 	}
-	if n := f.counters().Switches["better_latency"]; n != 0 {
+	if n := f.counters().Switches[reasonBetterLatency]; n != 0 {
 		t.Fatalf("jitter under tolerance must not switch, got %d switches", n)
 	}
 	// Positive arm: b is better than a by more than the tolerance and stays there for longer
@@ -70,7 +70,7 @@ func TestScenarioLatencyFlapDoesNotSwitch(t *testing.T) {
 	if s.Now() != "b" {
 		t.Fatalf("a sustained excursion beyond the tolerance must switch, got %q", s.Now())
 	}
-	if n := f.counters().Switches["better_latency"]; n != 1 {
+	if n := f.counters().Switches[reasonBetterLatency]; n != 1 {
 		t.Fatalf("the excursion is one switch, got %d", n)
 	}
 	// ... and jitter under the tolerance must not send it back.
@@ -86,5 +86,5 @@ func TestScenarioLatencyFlapDoesNotSwitch(t *testing.T) {
 	if s.Now() != "b" {
 		t.Fatalf("jitter under tolerance must not switch back, got %q", s.Now())
 	}
-	t.Logf("SCENARIO name=latency_jitter_24h probes=0 switches=%d recovery_ms=0", f.counters().Switches["better_latency"])
+	t.Logf("SCENARIO name=latency_jitter_24h probes=0 switches=%d recovery_ms=0", f.counters().Switches[reasonBetterLatency])
 }

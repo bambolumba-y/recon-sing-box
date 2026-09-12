@@ -454,6 +454,17 @@ func (m *OutboundMonitoring) TestAndWait(ctx context.Context, tag string, timeou
 		return adapter.URLTestHistory{}, errors.New("outbound not registered")
 	}
 
+	// Mark the outbound as under test, exactly like executeTask does, so the sweep does not
+	// queue a second probe of the same server on top of this one and land an older result
+	// after the newer one. A caller that arrives while another test is already running still
+	// gets its own answer, but must not clear a flag it did not set.
+	state.mu.Lock()
+	markedTesting := !state.testing
+	if markedTesting {
+		state.testing = true
+	}
+	state.mu.Unlock()
+
 	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -477,6 +488,12 @@ func (m *OutboundMonitoring) TestAndWait(ctx context.Context, tag string, timeou
 		err:         err,
 		priority:    true,
 	})
+
+	if markedTesting {
+		state.mu.Lock()
+		state.testing = false
+		state.mu.Unlock()
+	}
 
 	return his, err
 }

@@ -15,6 +15,10 @@ type stallTracker struct {
 	now     func() time.Time
 	onStall func(tag string)
 
+	// notify carries a single token published when the tracked set goes from empty to
+	// non-empty. The loop parks on it instead of ticking through an idle tunnel.
+	notify chan struct{}
+
 	mu         sync.Mutex
 	conns      map[*stallConn]struct{}
 	stalls     []time.Time
@@ -46,15 +50,63 @@ var (
 )
 
 func newStallTracker(cfg failoverConfig, now func() time.Time, onStall func(tag string)) *stallTracker {
-	return &stallTracker{cfg: cfg, now: now, onStall: onStall, conns: map[*stallConn]struct{}{}}
+	return &stallTracker{
+		cfg:     cfg,
+		now:     now,
+		onStall: onStall,
+		conns:   map[*stallConn]struct{}{},
+		notify:  make(chan struct{}, 1),
+	}
 }
 
 func (t *stallTracker) wrap(conn net.Conn, tag string) net.Conn {
 	c := &stallConn{Conn: conn, tracker: t, tag: tag}
 	t.mu.Lock()
+	first := len(t.conns) == 0
 	t.conns[c] = struct{}{}
 	t.mu.Unlock()
+	// Only the 0 -> 1 transition needs to wake the loop; while it is already ticking the
+	// token would be a wakeup for nothing. A token left over from a set that emptied again
+	// costs one spurious pass that finds size() == 0 and parks.
+	if first {
+		select {
+		case t.notify <- struct{}{}:
+		default:
+		}
+	}
 	return c
+}
+
+// runStallLoop drives the detector. The ticker exists only while connections are tracked; with
+// none the loop parks on notify, so an idle tunnel costs no periodic wakeups at all. tick is the
+// interval (stallTick in production, a short one in tests).
+func runStallLoop(t *stallTracker, tick time.Duration, currentTag func() string, done, ctxDone <-chan struct{}) {
+	for {
+		if t.size() == 0 {
+			select {
+			case <-done:
+				return
+			case <-ctxDone:
+				return
+			case <-t.notify:
+			}
+			continue
+		}
+		ticker := time.NewTicker(tick)
+		for t.size() > 0 {
+			select {
+			case <-done:
+				ticker.Stop()
+				return
+			case <-ctxDone:
+				ticker.Stop()
+				return
+			case <-ticker.C:
+				t.tick(currentTag())
+			}
+		}
+		ticker.Stop()
+	}
 }
 
 func (t *stallTracker) size() int { t.mu.Lock(); defer t.mu.Unlock(); return len(t.conns) }

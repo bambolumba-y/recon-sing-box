@@ -17,15 +17,6 @@ import (
 // would leave the tag unmeasured, so such a result is not a usable rescue answer.
 var errZeroDelay = errors.New("probe returned a zero delay")
 
-// Failure reasons used by the controller itself. Callers may pass their own.
-const (
-	reasonStall           = "stall"
-	reasonProbeFailed     = "probe_failed"
-	reasonNetworkChange   = "network_change"
-	reasonRescueExhausted = "rescue_exhausted"
-	reasonDialError       = "dial_error"
-)
-
 // prober measures one outbound. The implementation lives in the monitoring package.
 type prober interface {
 	Probe(ctx context.Context, tag string, timeout time.Duration) (delay uint16, err error)
@@ -42,7 +33,7 @@ type failoverCounters struct {
 	ProbesOK, ProbesFailed                      uint64
 	Rescues, RescueExhausted                    uint64
 	Switches                                    map[string]uint64 // by reason
-	Stalls                                      uint64
+	Stalls, StallsSuppressed                    uint64
 }
 
 type failover struct {
@@ -60,9 +51,10 @@ type failover struct {
 
 	// hookMu guards the seams the Balancer installs after construction; the loops read them
 	// from their own goroutines.
-	hookMu      sync.Mutex
-	paused      func() bool
-	resetStalls func()
+	hookMu        sync.Mutex
+	paused        func() bool
+	networkPaused func() bool
+	resetStalls   func()
 
 	// eventsMu serialises draining the strategy event buffer, so a switch is logged once.
 	eventsMu sync.Mutex
@@ -79,7 +71,12 @@ type failover struct {
 
 	cProbesActive, cProbesRescue, cProbesInterface atomic.Uint64
 	cProbesOK, cProbesFailed                       atomic.Uint64
-	cRescues, cRescueExhausted, cStalls            atomic.Uint64
+	cRescues, cRescueExhausted                     atomic.Uint64
+	cStalls, cStallsSuppressed                     atomic.Uint64
+
+	// inflight counts the short-lived probe goroutines registered through spawn, so waitIdle
+	// reports idle only once they are gone too, not just the rescue scan.
+	inflight atomic.Int64
 
 	switchMu sync.Mutex
 	switches map[string]uint64
@@ -91,18 +88,19 @@ func newFailover(ctx context.Context, cfg failoverConfig, strategy *LowestDelay,
 		onSwitch = func() {}
 	}
 	return &failover{
-		ctx:         ctx,
-		cancel:      cancel,
-		cfg:         cfg,
-		strategy:    strategy,
-		probe:       probe,
-		logger:      logger,
-		onSwitch:    onSwitch,
-		paused:      func() bool { return false },
-		resetStalls: func() {},
-		now:         time.Now,
-		sleepFn:     sleepCtx,
-		switches:    map[string]uint64{},
+		ctx:           ctx,
+		cancel:        cancel,
+		cfg:           cfg,
+		strategy:      strategy,
+		probe:         probe,
+		logger:        logger,
+		onSwitch:      onSwitch,
+		paused:        func() bool { return false },
+		networkPaused: func() bool { return false },
+		resetStalls:   func() {},
+		now:           time.Now,
+		sleepFn:       sleepCtx,
+		switches:      map[string]uint64{},
 	}
 }
 
@@ -131,14 +129,27 @@ func (f *failover) setClock(now func() time.Time, sleep func(ctx context.Context
 	}
 }
 
-// setPaused installs the predicate that suspends the active check (the Balancer pauses it while
-// the tunnel is idle or the screen is off).
+// setPaused installs the predicate that suspends the active check. The Balancer passes the pause
+// manager's IsPaused: device pause (screen off, no traffic) or network pause (no usable network).
 func (f *failover) setPaused(paused func() bool) {
 	if paused == nil {
 		return
 	}
 	f.hookMu.Lock()
 	f.paused = paused
+	f.hookMu.Unlock()
+}
+
+// setNetworkPaused installs the predicate that reports "there is no network". The rescue scan
+// waits on it instead of probing: with the radio down every probe is a guaranteed failure that
+// still costs a wakeup, and the exhausted counter would climb for a reason that is not the
+// servers' fault.
+func (f *failover) setNetworkPaused(paused func() bool) {
+	if paused == nil {
+		return
+	}
+	f.hookMu.Lock()
+	f.networkPaused = paused
 	f.hookMu.Unlock()
 }
 
@@ -155,6 +166,13 @@ func (f *failover) setResetStalls(reset func()) {
 func (f *failover) isPaused() bool {
 	f.hookMu.Lock()
 	paused := f.paused
+	f.hookMu.Unlock()
+	return paused()
+}
+
+func (f *failover) isNetworkPaused() bool {
+	f.hookMu.Lock()
+	paused := f.networkPaused
 	f.hookMu.Unlock()
 	return paused()
 }
@@ -241,14 +259,47 @@ func (f *failover) diagLoop() {
 
 // reportFailure is the single entry point for dial errors, stalls and failed probes.
 func (f *failover) reportFailure(tag, reason string) {
-	if tag == "" || tag != f.strategy.Now() {
+	// IsSelected, not Now(): Now() is the TCP selection, and a UDP dial error on a tag that is
+	// current for UDP alone is a real failure of a server in use.
+	if tag == "" || !f.strategy.IsSelected(tag) {
 		// The failure belongs to a server that is no longer selected. Invalidating its
 		// monitoring history is the caller's job; there is nothing to switch here.
 		return
 	}
 	if reason == reasonStall {
 		f.cStalls.Add(1)
+		f.confirmStall(tag)
+		return
 	}
+	f.handleFailure(tag, reason)
+}
+
+// confirmStall probes the stalled server once before acting on it. Silent bytes are not proof of
+// a dead server: an idle long poll writes a request and waits, which the byte counters cannot
+// tell apart from a server that stopped answering. A server that still answers a probe keeps the
+// selection, and the switch (a reconnect for every live connection) is not paid for nothing.
+// The probe is charged to ProbesActive: like the active check, it is the controller checking the
+// server it is already on.
+func (f *failover) confirmStall(tag string) {
+	f.spawn(func() {
+		if _, err := f.probeOnce(tag, &f.cProbesActive); err == nil {
+			f.cStallsSuppressed.Add(1)
+			return
+		}
+		if f.ctx.Err() != nil {
+			return
+		}
+		// The selection may have moved while the confirmation probe ran.
+		if !f.strategy.IsSelected(tag) {
+			return
+		}
+		f.handleFailure(tag, reasonStall)
+	})
+}
+
+// handleFailure is the switch-or-rescue half of reportFailure, reached directly for every reason
+// but stall, and after the confirmation probe for a stall.
+func (f *failover) handleFailure(tag, reason string) {
 	switched, hasCandidate := f.strategy.MarkFailed(tag, reason)
 	if switched {
 		f.drainEvents()
@@ -258,6 +309,26 @@ func (f *failover) reportFailure(tag, reason string) {
 	if !hasCandidate {
 		f.startRescue(reason)
 	}
+}
+
+// spawn runs fn on a goroutine registered under rescueMu, so stop cannot start waiting after the
+// wait group was already left behind, and waitIdle counts it. A closed controller starts nothing.
+func (f *failover) spawn(fn func()) {
+	f.rescueMu.Lock()
+	if f.closed {
+		f.rescueMu.Unlock()
+		return
+	}
+	f.inflight.Add(1)
+	f.wg.Add(1)
+	f.rescueMu.Unlock()
+	go func() {
+		defer func() {
+			f.inflight.Add(-1)
+			f.wg.Done()
+		}()
+		fn()
+	}()
 }
 
 // startRescue launches the rescue scan. It is single flight: while a scan runs, further calls do
@@ -291,9 +362,18 @@ func (f *failover) startRescue(reason string) {
 
 func (f *failover) runRescue(reason string) {
 	started := f.timeNow()
-	for attempt := 0; ; attempt++ {
+	for attempt := 0; ; {
 		if f.ctx.Err() != nil {
 			return
+		}
+		if f.isNetworkPaused() {
+			// No usable network: a scan would probe every server for a guaranteed
+			// timeout. Wait and look again without spending an attempt, so the backoff
+			// still starts from the short end once the network is back.
+			if err := f.sleep(f.ctx, rescueBackoff[0]); err != nil {
+				return
+			}
+			continue
 		}
 		from := f.strategy.Now()
 		if from == "" || f.strategy.Healthy(from) {
@@ -310,6 +390,7 @@ func (f *failover) runRescue(reason string) {
 		f.cRescueExhausted.Add(1)
 		f.logSwitchLine(from, from, reasonRescueExhausted, f.elapsedMS(started))
 		backoff := rescueBackoff[min(attempt, len(rescueBackoff)-1)]
+		attempt++
 		if err := f.sleep(f.ctx, backoff); err != nil {
 			return
 		}
@@ -413,26 +494,18 @@ func (f *failover) onInterfaceChange() {
 	if tag == "" {
 		return
 	}
-	f.rescueMu.Lock()
-	if f.closed {
-		f.rescueMu.Unlock()
-		return
-	}
-	f.wg.Add(1)
-	f.rescueMu.Unlock()
-	go func() {
-		defer f.wg.Done()
+	f.spawn(func() {
 		if _, err := f.probeOnce(tag, &f.cProbesInterface); err != nil {
 			if f.ctx.Err() != nil {
 				return
 			}
 			f.reportFailure(tag, reasonNetworkChange)
 		}
-	}()
+	})
 }
 
-// drainEvents logs the strategy switch events as failover lines. Only TCP events are logged; UDP
-// mirrors TCP and is counted only.
+// drainEvents logs the strategy switch events as failover lines. Only TCP events are logged; a
+// UDP event that mirrors one is the same switch seen twice.
 func (f *failover) drainEvents() {
 	f.eventsMu.Lock()
 	defer f.eventsMu.Unlock()
@@ -440,17 +513,25 @@ func (f *failover) drainEvents() {
 }
 
 // consumeEventsLocked drains the strategy event buffer. The caller holds eventsMu.
+//
+// A normal switch produces a mirrored pair, TCP first then UDP, carrying the same from/to/reason:
+// that is one switch and is counted once. A UDP-only change (the tag was current for UDP alone)
+// has no TCP twin, so it is counted on its own instead of being dropped. Logging stays TCP-only:
+// the UDP line of a mirrored pair would just repeat the TCP one, and a lone UDP switch is not
+// worth a line on the device.
 func (f *failover) consumeEventsLocked(log bool) {
-	for _, ev := range f.strategy.Events() {
-		// UDP mirrors TCP, so counting both networks would report every switch twice.
-		// Count and log on the same condition: one TCP event, one switch.
-		if ev.Network != N.NetworkTCP {
+	events := f.strategy.Events()
+	seen := make(map[switchEvent]struct{}, len(events))
+	for _, ev := range events {
+		key := switchEvent{From: ev.From, To: ev.To, Reason: ev.Reason}
+		if _, dup := seen[key]; dup {
 			continue
 		}
+		seen[key] = struct{}{}
 		f.switchMu.Lock()
 		f.switches[ev.Reason]++
 		f.switchMu.Unlock()
-		if log {
+		if log && ev.Network == N.NetworkTCP {
 			f.logSwitchLine(ev.From, ev.To, ev.Reason, 0)
 		}
 	}
@@ -489,6 +570,7 @@ func (f *failover) logDiag() {
 		" rescues=", c.Rescues,
 		" rescue_exhausted=", c.RescueExhausted,
 		" stalls=", c.Stalls,
+		" stalls_suppressed=", c.StallsSuppressed,
 		" switches=", strings.Join(parts, ","),
 	)
 }
@@ -501,20 +583,24 @@ func (f *failover) counters() failoverCounters {
 	}
 	f.switchMu.Unlock()
 	return failoverCounters{
-		ProbesActive:    f.cProbesActive.Load(),
-		ProbesRescue:    f.cProbesRescue.Load(),
-		ProbesInterface: f.cProbesInterface.Load(),
-		ProbesOK:        f.cProbesOK.Load(),
-		ProbesFailed:    f.cProbesFailed.Load(),
-		Rescues:         f.cRescues.Load(),
-		RescueExhausted: f.cRescueExhausted.Load(),
-		Switches:        switches,
-		Stalls:          f.cStalls.Load(),
+		ProbesActive:     f.cProbesActive.Load(),
+		ProbesRescue:     f.cProbesRescue.Load(),
+		ProbesInterface:  f.cProbesInterface.Load(),
+		ProbesOK:         f.cProbesOK.Load(),
+		ProbesFailed:     f.cProbesFailed.Load(),
+		Rescues:          f.cRescues.Load(),
+		RescueExhausted:  f.cRescueExhausted.Load(),
+		Switches:         switches,
+		Stalls:           f.cStalls.Load(),
+		StallsSuppressed: f.cStallsSuppressed.Load(),
 	}
 }
 
-// waitIdle reports whether no rescue is running. It returns true only after the rescue goroutine
-// has fully exited, which makes the tests deterministic.
+// waitIdle reports whether the controller has nothing in flight: no rescue scan and no spawned
+// probe (stall confirmation, interface check). It returns true only after those goroutines have
+// fully exited, which makes the tests deterministic. inflight is raised before the goroutine
+// starts and lowered after it returns, and a confirmation that decides to rescue has already
+// published rescueDone by then, so the two never both read idle in the gap.
 func (f *failover) waitIdle(timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for {
@@ -522,7 +608,14 @@ func (f *failover) waitIdle(timeout time.Duration) bool {
 		done := f.rescueDone
 		f.rescueMu.Unlock()
 		if done == nil {
-			return true
+			if f.inflight.Load() == 0 {
+				return true
+			}
+			if time.Now().After(deadline) {
+				return false
+			}
+			time.Sleep(time.Millisecond)
+			continue
 		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {

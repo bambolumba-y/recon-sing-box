@@ -11,8 +11,12 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/interrupt"
+	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json/badoption"
+	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 )
 
 type scriptedProber struct {
@@ -146,7 +150,7 @@ func newHarness(t *testing.T, tags ...string) (*failover, *LowestDelay, *scripte
 func TestFailureWithCandidateSwitchesWithoutProbe(t *testing.T) {
 	f, s, p, l, c := newHarness(t, "a", "b")
 	s.UpdateOutboundsInfo(map[string]*adapter.URLTestHistory{"a": measured(100, c.Now()), "b": measured(200, c.Now())})
-	f.reportFailure("a", "dial_error")
+	f.reportFailure("a", reasonDialError)
 	if s.Now() != "b" || len(p.callList()) != 0 {
 		t.Fatalf("now=%q probes=%v", s.Now(), p.callList())
 	}
@@ -158,7 +162,7 @@ func TestFailureWithCandidateSwitchesWithoutProbe(t *testing.T) {
 func TestFailureForNonCurrentIsIgnored(t *testing.T) {
 	f, s, _, _, c := newHarness(t, "a", "b")
 	s.UpdateOutboundsInfo(map[string]*adapter.URLTestHistory{"a": measured(100, c.Now()), "b": measured(200, c.Now())})
-	f.reportFailure("b", "dial_error")
+	f.reportFailure("b", reasonDialError)
 	if s.Now() != "a" || !s.Healthy("a") {
 		t.Fatal("a failure of a non-selected server must not move the selection")
 	}
@@ -168,7 +172,7 @@ func TestRescuePicksFirstResponderInBatches(t *testing.T) {
 	f, s, p, l, c := newHarness(t, "a", "b", "c", "d", "e")
 	s.UpdateOutboundsInfo(map[string]*adapter.URLTestHistory{"a": measured(100, c.Now())})
 	p.set("d", 300) // only d answers; batches: [b c] then [d e]
-	f.reportFailure("a", "stall")
+	f.reportFailure("a", reasonStall)
 	if !f.waitIdle(2 * time.Second) {
 		t.Fatal("rescue did not finish")
 	}
@@ -189,7 +193,7 @@ func TestRescuePicksFirstResponderInBatches(t *testing.T) {
 func TestRescueExhaustedBacksOffThenRecovers(t *testing.T) {
 	f, s, p, l, c := newHarness(t, "a", "b", "c")
 	s.UpdateOutboundsInfo(map[string]*adapter.URLTestHistory{"a": measured(100, c.Now())})
-	f.reportFailure("a", "dial_error")
+	f.reportFailure("a", reasonDialError)
 	deadline := time.Now().Add(2 * time.Second)
 	for p.count("b") < 2 && time.Now().Before(deadline) { // second attempt reached => backoff slept once
 		time.Sleep(5 * time.Millisecond)
@@ -211,9 +215,9 @@ func TestRescueIsSingleFlight(t *testing.T) {
 	s.UpdateOutboundsInfo(map[string]*adapter.URLTestHistory{"a": measured(100, c.Now())})
 	gate := make(chan struct{})
 	p.block["b"] = gate
-	f.reportFailure("a", "dial_error")
-	f.reportFailure("a", "stall")
-	f.reportFailure("a", "probe_failed")
+	f.reportFailure("a", reasonDialError)
+	f.reportFailure("a", reasonStall)
+	f.reportFailure("a", reasonProbeFailed)
 	time.Sleep(20 * time.Millisecond)
 	if p.count("b") != 1 {
 		t.Fatalf("concurrent failure reports must not start parallel rescues: %v", p.callList())
@@ -228,7 +232,7 @@ func TestRescueIsSingleFlight(t *testing.T) {
 func TestRescueStopsWhenCurrentRevives(t *testing.T) {
 	f, s, p, _, c := newHarness(t, "a", "b")
 	s.UpdateOutboundsInfo(map[string]*adapter.URLTestHistory{"a": measured(100, c.Now())})
-	f.reportFailure("a", "dial_error") // b unknown and failing -> exhausted, backoff
+	f.reportFailure("a", reasonDialError) // b unknown and failing -> exhausted, backoff
 	time.Sleep(20 * time.Millisecond)
 	c.Advance(time.Second)
 	s.UpdateOutboundsInfo(map[string]*adapter.URLTestHistory{"a": measured(90, c.Now())}) // sweep says a is fine
@@ -291,7 +295,7 @@ func TestRescuePicksLowestDelayInBatch(t *testing.T) {
 	// order Candidates returned them in.
 	p.set("b", 300)
 	p.set("c", 120)
-	f.reportFailure("a", "dial_error")
+	f.reportFailure("a", reasonDialError)
 	if !f.waitIdle(2 * time.Second) {
 		t.Fatal("rescue did not finish")
 	}
@@ -308,7 +312,7 @@ func TestFailureRightAfterRescueStartsANewRescue(t *testing.T) {
 	s.UpdateOutboundsInfo(map[string]*adapter.URLTestHistory{"a": measured(100, c.Now())})
 	gate := make(chan struct{})
 	p.block["b"] = gate
-	f.reportFailure("a", "dial_error")
+	f.reportFailure("a", reasonDialError)
 	p.set("b", 120)
 	close(gate)
 	if !f.waitIdle(2*time.Second) || s.Now() != "b" {
@@ -317,7 +321,7 @@ func TestFailureRightAfterRescueStartsANewRescue(t *testing.T) {
 	// b is only synthetically healthy; a dial error arriving right now must not be swallowed
 	// by a single-flight flag that outlives the idle state.
 	before := f.counters()
-	f.reportFailure("b", "dial_error")
+	f.reportFailure("b", reasonDialError)
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if got := f.counters(); got.ProbesRescue > before.ProbesRescue && got.RescueExhausted > before.RescueExhausted {
@@ -331,11 +335,11 @@ func TestFailureRightAfterRescueStartsANewRescue(t *testing.T) {
 func TestStallsCountedOnlyForTheCurrentTag(t *testing.T) {
 	f, s, _, _, c := newHarness(t, "a", "b")
 	s.UpdateOutboundsInfo(map[string]*adapter.URLTestHistory{"a": measured(100, c.Now()), "b": measured(200, c.Now())})
-	f.reportFailure("b", "stall")
+	f.reportFailure("b", reasonStall)
 	if got := f.counters().Stalls; got != 0 {
 		t.Fatalf("a stall on a non-selected server must not be counted: stalls=%d", got)
 	}
-	f.reportFailure("a", "stall")
+	f.reportFailure("a", reasonStall)
 	if got := f.counters().Stalls; got != 1 {
 		t.Fatalf("stalls=%d, want 1", got)
 	}
@@ -402,7 +406,7 @@ func TestStopIsIdempotentAndEndsARescueInBackoff(t *testing.T) {
 	f, s, p, _, c := newHarness(t, "a", "b")
 	s.UpdateOutboundsInfo(map[string]*adapter.URLTestHistory{"a": measured(100, c.Now())})
 	f.start()
-	f.reportFailure("a", "dial_error") // b never answers: exhausted, then backoff forever
+	f.reportFailure("a", reasonDialError) // b never answers: exhausted, then backoff forever
 	deadline := time.Now().Add(2 * time.Second)
 	for f.counters().RescueExhausted == 0 && time.Now().Before(deadline) {
 		time.Sleep(2 * time.Millisecond)
@@ -425,8 +429,207 @@ func TestStopIsIdempotentAndEndsARescueInBackoff(t *testing.T) {
 		t.Fatal("the rescue goroutine outlived stop")
 	}
 	// After stop no new rescue may be launched.
-	f.reportFailure("a", "dial_error")
+	f.reportFailure("a", reasonDialError)
 	if !f.waitIdle(time.Second) {
 		t.Fatal("a rescue was started after stop")
+	}
+}
+
+// waitUntil polls cond, which is what the asynchronous halves of the controller (the stall
+// confirmation probe, a rescue) need instead of a fixed sleep.
+func waitUntil(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+// --- R1: the rescue scan waits out a network pause ---
+
+func TestRescueDoesNotProbeWhileNetworkPaused(t *testing.T) {
+	f, s, p, _, c := newHarness(t, "a", "b", "c")
+	s.UpdateOutboundsInfo(map[string]*adapter.URLTestHistory{"a": measured(100, c.Now())})
+	var netPaused atomic.Bool
+	netPaused.Store(true)
+	f.setNetworkPaused(netPaused.Load)
+
+	f.reportFailure("a", reasonDialError) // nothing healthy left -> rescue
+	// The rescue loop spins through its wait; give it many turns and prove that none of them
+	// probed and none of them burned an attempt.
+	time.Sleep(60 * time.Millisecond)
+	if calls := p.callList(); len(calls) != 0 {
+		t.Fatalf("a rescue must not probe while the network is paused: %v", calls)
+	}
+	if got := f.counters().RescueExhausted; got != 0 {
+		t.Fatalf("waiting for the network must not spend rescue attempts, exhausted=%d", got)
+	}
+
+	p.set("b", 120)
+	netPaused.Store(false)
+	if !f.waitIdle(3*time.Second) || s.Now() != "b" {
+		t.Fatalf("the rescue must resume once the network is back: now=%q calls=%v", s.Now(), p.callList())
+	}
+}
+
+func TestNetworkPausedRescueStopsOnCancel(t *testing.T) {
+	f, s, _, _, c := newHarness(t, "a", "b")
+	s.UpdateOutboundsInfo(map[string]*adapter.URLTestHistory{"a": measured(100, c.Now())})
+	f.setNetworkPaused(func() bool { return true })
+	f.start()
+	f.reportFailure("a", reasonDialError)
+	time.Sleep(20 * time.Millisecond)
+	done := make(chan struct{})
+	go func() { f.stop(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("stop must return while a rescue is parked waiting for the network")
+	}
+}
+
+// --- R3: a failure on a tag that is current for UDP only ---
+
+// udpOnlyHarness selects a TCP-only server for TCP and "u1" for UDP, so "u1" is current for UDP
+// and not for TCP.
+func udpOnlyHarness(t *testing.T) (*failover, *LowestDelay, *fakeClock) {
+	t.Helper()
+	clock := newFakeClock()
+	outs := []adapter.Outbound{
+		newFakeOutboundNetworks("tcponly", N.NetworkTCP),
+		newFakeOutboundNetworks("u1", N.NetworkTCP, N.NetworkUDP),
+		newFakeOutboundNetworks("u2", N.NetworkTCP, N.NetworkUDP),
+	}
+	strategy := NewLowestDelay(outs, option.BalancerOutboundOptions{ActiveCheckInterval: badoption.Duration(-1)})
+	strategy.setClock(clock.Now)
+	// Seed u2 as measured without an UpdateOutboundsInfo, which would move the TCP selection
+	// too and destroy the split this test needs.
+	strategy.mu.Lock()
+	strategy.history["u2"] = measured(200, clock.Now())
+	strategy.mu.Unlock()
+	if strategy.Now() != "tcponly" {
+		t.Fatalf("tcp selection = %q, want tcponly", strategy.Now())
+	}
+	if udp := strategy.Select(adapter.InboundContext{}, N.NetworkUDP, false); udp.Tag() != "u1" {
+		t.Fatalf("udp selection = %q, want u1", udp.Tag())
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	p := &scriptedProber{delays: map[string]uint16{}, block: map[string]chan struct{}{}}
+	f := newFailover(ctx, strategy.cfg, strategy, p, &memLogger{}, func() {})
+	f.setClock(clock.Now, virtualSleep(clock))
+	t.Cleanup(func() { cancel(); f.waitIdle(time.Second) })
+	return f, strategy, clock
+}
+
+func TestIsSelectedCoversUDP(t *testing.T) {
+	_, s, _ := udpOnlyHarness(t)
+	if !s.IsSelected("tcponly") || !s.IsSelected("u1") {
+		t.Fatal("both the TCP and the UDP selection must count as selected")
+	}
+	if s.IsSelected("u2") {
+		t.Fatal("u2 is selected for neither network")
+	}
+}
+
+func TestUDPOnlyFailureSwitchesUDPAndIsCounted(t *testing.T) {
+	f, s, _ := udpOnlyHarness(t)
+	f.reportFailure("u1", reasonDialError)
+	if s.Now() != "tcponly" {
+		t.Fatalf("the TCP selection must not move, now=%q", s.Now())
+	}
+	if udp := s.Select(adapter.InboundContext{}, N.NetworkUDP, false); udp.Tag() != "u2" {
+		t.Fatalf("udp selection = %q, want u2", udp.Tag())
+	}
+	if n := f.counters().Switches[reasonDialError]; n != 1 {
+		t.Fatalf("a UDP-only switch must be counted once, got %d", n)
+	}
+}
+
+func TestMirroredSwitchIsCountedOnce(t *testing.T) {
+	f, s, _, _, c := newHarness(t, "a", "b")
+	s.UpdateOutboundsInfo(map[string]*adapter.URLTestHistory{"a": measured(100, c.Now()), "b": measured(200, c.Now())})
+	f.reportFailure("a", reasonDialError)
+	if n := f.counters().Switches[reasonDialError]; n != 1 {
+		t.Fatalf("the TCP+UDP pair of one switch must be counted once, got %d", n)
+	}
+}
+
+func TestListenPacketErrorReportsFailure(t *testing.T) {
+	f, s, _, _, c := newHarness(t, "a", "b")
+	s.UpdateOutboundsInfo(map[string]*adapter.URLTestHistory{"a": measured(100, c.Now()), "b": measured(200, c.Now())})
+	// monitor is nil on purpose: that is the Clash-API-off case, where InvalidateTest used to
+	// dereference nil before the failure could ever be reported.
+	b := &Balancer{
+		ctx:            context.Background(),
+		logger:         log.NewNOPFactory().NewLogger("test"),
+		strategyFn:     s,
+		failover:       f,
+		interruptGroup: interrupt.NewGroup(),
+	}
+	if _, err := b.ListenPacket(context.Background(), M.Socksaddr{}); err == nil {
+		t.Fatal("the fake outbound must fail to listen")
+	}
+	if s.Now() != "b" {
+		t.Fatalf("a UDP listen error must move the selection, now=%q", s.Now())
+	}
+	if n := f.counters().Switches[reasonDialError]; n != 1 {
+		t.Fatalf("switches[dial_error] = %d, want 1", n)
+	}
+}
+
+// --- R4: a stall is confirmed by a probe before it switches ---
+
+func TestStallWithHealthyProbeIsSuppressed(t *testing.T) {
+	f, s, p, _, c := newHarness(t, "a", "b")
+	s.UpdateOutboundsInfo(map[string]*adapter.URLTestHistory{"a": measured(100, c.Now()), "b": measured(200, c.Now())})
+	p.set("a", 90) // the "stalled" server still answers: an idle long poll, not a dead server
+	f.reportFailure("a", reasonStall)
+	if !f.waitIdle(3 * time.Second) {
+		t.Fatal("the confirmation probe did not finish")
+	}
+	if got := f.counters(); got.StallsSuppressed != 1 || got.Stalls != 1 {
+		t.Fatalf("counters = %+v, want stalls=1 stalls_suppressed=1", got)
+	}
+	if s.Now() != "a" {
+		t.Fatalf("a confirmed-alive server must keep the selection, now=%q", s.Now())
+	}
+	if n := f.counters().Switches[reasonStall]; n != 0 {
+		t.Fatalf("no switch may be recorded, got %d", n)
+	}
+	if p.count("a") != 1 {
+		t.Fatalf("the confirmation must be exactly one probe, calls=%v", p.callList())
+	}
+}
+
+func TestStallWithFailingProbeSwitches(t *testing.T) {
+	f, s, p, l, c := newHarness(t, "a", "b")
+	s.UpdateOutboundsInfo(map[string]*adapter.URLTestHistory{"a": measured(100, c.Now()), "b": measured(200, c.Now())})
+	// "a" is not in the prober's table, so the confirmation probe fails.
+	f.reportFailure("a", reasonStall)
+	waitUntil(t, "the stall to be confirmed and switched", func() bool { return s.Now() == "b" })
+	if !f.waitIdle(3 * time.Second) {
+		t.Fatal("the confirmation probe did not finish")
+	}
+	if got := f.counters(); got.Stalls != 1 || got.StallsSuppressed != 0 {
+		t.Fatalf("counters = %+v, want stalls=1 stalls_suppressed=0", got)
+	}
+	if !l.has("failover: a -> b reason=stall") {
+		t.Fatalf("lines: %v", l.snapshot())
+	}
+	if p.count("a") != 1 {
+		t.Fatalf("calls=%v", p.callList())
+	}
+}
+
+func TestDiagLineCarriesSuppressedStalls(t *testing.T) {
+	f, _, _, l, _ := newHarness(t, "a", "b")
+	f.logDiag()
+	if !l.has(" stalls=0 stalls_suppressed=0 switches=") {
+		t.Fatalf("lines: %v", l.snapshot())
 	}
 }

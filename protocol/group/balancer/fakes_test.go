@@ -37,6 +37,12 @@ func (f *fakeOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr
 	return nil, net.ErrClosed
 }
 
+// newFakeOutboundNetworks builds an outbound that supports only the given networks, so a test can
+// desynchronise the TCP and UDP selections the way a TCP-only server does in production.
+func newFakeOutboundNetworks(tag string, networks ...string) *fakeOutbound {
+	return &fakeOutbound{Adapter: outbound.NewAdapter("fake", tag, networks, nil)}
+}
+
 func fakeOutbounds(tags ...string) []adapter.Outbound {
 	res := make([]adapter.Outbound, 0, len(tags))
 	for _, tag := range tags {

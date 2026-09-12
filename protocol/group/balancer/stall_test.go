@@ -4,6 +4,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,6 +19,113 @@ func newTracker(clock *fakeClock) (*stallTracker, *[]string) {
 	var fired []string
 	cfg := normalizeFailover(optionWith(8*time.Second, 3, 30*time.Second))
 	return newStallTracker(cfg, clock.Now, func(tag string) { fired = append(fired, tag) }), &fired
+}
+
+// --- R2: the ticker runs only while connections are tracked ---
+
+func TestWrapSignalsOnlyTheFirstConn(t *testing.T) {
+	clock := newFakeClock()
+	tr, _ := newTracker(clock)
+	select {
+	case <-tr.notify:
+		t.Fatal("an empty tracker must not have a pending signal")
+	default:
+	}
+
+	c1, _ := net.Pipe()
+	w1 := tr.wrap(c1, "a")
+	select {
+	case <-tr.notify:
+	default:
+		t.Fatal("the 0 -> 1 transition must wake the loop")
+	}
+
+	c2, _ := net.Pipe()
+	tr.wrap(c2, "a")
+	select {
+	case <-tr.notify:
+		t.Fatal("a second conn on a non-empty set must not signal again")
+	default:
+	}
+
+	// Emptying and refilling the set signals again.
+	w1.Close()
+	c3, _ := net.Pipe()
+	tr.wrap(c3, "a")
+	select {
+	case <-tr.notify:
+		t.Fatal("the set never reached zero (c2 is still tracked), so no new signal is due")
+	default:
+	}
+}
+
+// TestStallLoopIsSilentWhileIdle is the battery guarantee: with no tracked connection the loop
+// costs zero wakeups, and it starts ticking the moment one appears. It drives runStallLoop
+// directly, with a 2 ms tick, so no Balancer and no real second are involved.
+func TestStallLoopIsSilentWhileIdle(t *testing.T) {
+	var ticks atomic.Int64
+	clock := newFakeClock()
+	cfg := normalizeFailover(optionWith(8*time.Second, 3, 30*time.Second))
+	// tick() calls now() first thing and nothing else in this test does, so counting now()
+	// calls counts ticks.
+	tr := newStallTracker(cfg, func() time.Time { ticks.Add(1); return clock.Now() }, func(tag string) {})
+
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		runStallLoop(tr, 2*time.Millisecond, func() string { return "a" }, done, make(chan struct{}))
+	}()
+
+	time.Sleep(50 * time.Millisecond) // ~25 ticks if the loop ran a ticker regardless
+	if n := ticks.Load(); n != 0 {
+		t.Fatalf("an idle tracker must not be ticked, got %d ticks", n)
+	}
+
+	conn, _ := net.Pipe()
+	wrapped := tr.wrap(conn, "a")
+	deadline := time.Now().Add(2 * time.Second)
+	for ticks.Load() < 3 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if ticks.Load() < 3 {
+		t.Fatalf("the loop must start ticking once a conn is tracked, got %d ticks", ticks.Load())
+	}
+
+	wrapped.Close()
+	// Let the loop notice the empty set, then prove it went quiet again.
+	time.Sleep(20 * time.Millisecond)
+	quiet := ticks.Load()
+	time.Sleep(50 * time.Millisecond)
+	if n := ticks.Load(); n != quiet {
+		t.Fatalf("the loop must park once the last conn closes, ticks went %d -> %d", quiet, n)
+	}
+
+	close(done)
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the loop must leave when done is closed")
+	}
+}
+
+func TestStallLoopLeavesOnContextDone(t *testing.T) {
+	clock := newFakeClock()
+	tr, _ := newTracker(clock)
+	ctxDone := make(chan struct{})
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		runStallLoop(tr, 2*time.Millisecond, func() string { return "a" }, make(chan struct{}), ctxDone)
+	}()
+	// Parked on notify, with no conn ever wrapped.
+	time.Sleep(10 * time.Millisecond)
+	close(ctxDone)
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("a parked loop must still observe a cancelled context")
+	}
 }
 
 func TestStallCountsOnlyWrittenUnreadConns(t *testing.T) {

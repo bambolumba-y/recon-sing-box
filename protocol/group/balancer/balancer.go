@@ -140,8 +140,16 @@ func (s *Balancer) Start() error {
 		})
 		s.failover.setResetStalls(s.stalls.reset)
 		if pm := service.FromContext[pause.Manager](s.ctx); pm != nil {
-			s.failover.setPaused(pm.IsDevicePaused)
+			// IsPaused covers both halves: the screen is off / the tunnel is idle, and
+			// there is no usable network. Either way an active probe is wasted radio.
+			s.failover.setPaused(pm.IsPaused)
+			s.failover.setNetworkPaused(pm.IsNetworkPaused)
 		}
+	}
+	if s.options.Strategy == StrategyLowestDelay && s.monitor == nil {
+		// Without the monitor there is no prober and no history, so nothing can detect or
+		// repair a dead server. Say it once instead of failing silently.
+		s.logger.Warn("load balance: failover is disabled, outbound monitoring is off")
 	}
 
 	return nil
@@ -157,23 +165,10 @@ func (s *Balancer) PostStart() error {
 	return nil
 }
 
-// stallLoop drives the stall detector. The tick is cheap: it only walks the tracker when there
-// are wrapped connections.
+// stallLoop drives the stall detector. It runs a ticker only while connections are tracked and
+// parks otherwise, so an idle tunnel wakes the CPU zero times per second instead of once.
 func (s *Balancer) stallLoop() {
-	ticker := time.NewTicker(stallTick)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-s.close:
-			return
-		case <-s.ctx.Done():
-			return
-		case <-ticker.C:
-			if s.stalls.size() > 0 {
-				s.stalls.tick(s.strategyFn.Now())
-			}
-		}
-	}
+	runStallLoop(s.stalls, stallTick, s.strategyFn.Now, s.close, s.ctx.Done())
 }
 
 func (s *Balancer) worker() {
@@ -263,7 +258,9 @@ func (s *Balancer) DialContext(ctx context.Context, network string, destination 
 		return s.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	s.monitor.InvalidateTest(outbound.Tag())
+	if s.monitor != nil {
+		s.monitor.InvalidateTest(outbound.Tag())
+	}
 	if s.failover != nil {
 		s.failover.reportFailure(outbound.Tag(), reasonDialError)
 	}
@@ -289,7 +286,12 @@ func (s *Balancer) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 		return s.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	s.monitor.InvalidateTest(outbound.Tag())
+	if s.monitor != nil {
+		s.monitor.InvalidateTest(outbound.Tag())
+	}
+	if s.failover != nil {
+		s.failover.reportFailure(outbound.Tag(), reasonDialError)
+	}
 	return nil, err
 }
 

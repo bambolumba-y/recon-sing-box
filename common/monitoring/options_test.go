@@ -116,3 +116,78 @@ func TestTestAndWaitAfterCloseReturnsError(t *testing.T) {
 		t.Fatalf("probe must not run after Close, got %d calls", probeCalls)
 	}
 }
+
+// TestTestAndWaitMarksStateTesting pins R5: while a direct probe is in flight the sweep must not
+// pick the same outbound up again, or two probes race and the older result can land last.
+func TestTestAndWaitMarksStateTesting(t *testing.T) {
+	m := newTestMonitor(t, option.MonitoringOptions{})
+	m.outbounds["test-tag"] = &outboundState{}
+
+	contains := func(tags []string, want string) bool {
+		for _, tag := range tags {
+			if tag == want {
+				return true
+			}
+		}
+		return false
+	}
+
+	if !contains(m.collectCycleTargets(), "test-tag") {
+		t.Fatal("baseline: an untested outbound must be a sweep target")
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	m.probe = func(ctx context.Context, tag string) (adapter.URLTestHistory, error) {
+		close(entered)
+		<-release
+		return adapter.URLTestHistory{Delay: 42}, nil
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		m.TestAndWait(context.Background(), "test-tag", time.Second)
+	}()
+
+	<-entered
+	if tags := m.collectCycleTargets(); contains(tags, "test-tag") {
+		t.Fatalf("an outbound under a direct probe must not be queued by the sweep: %v", tags)
+	}
+
+	close(release)
+	<-done
+
+	m.outbounds["test-tag"].mu.Lock()
+	stillTesting := m.outbounds["test-tag"].testing
+	m.outbounds["test-tag"].mu.Unlock()
+	if stillTesting {
+		t.Fatal("the testing flag must be cleared once the probe is applied")
+	}
+}
+
+// TestTestAndWaitDoesNotClobberAnotherTest pins the other half: a caller that arrives while a
+// queued test already holds the flag still gets its answer, but must not clear a flag it did not
+// set.
+func TestTestAndWaitDoesNotClobberAnotherTest(t *testing.T) {
+	m := newTestMonitor(t, option.MonitoringOptions{})
+	state := &outboundState{}
+	m.outbounds["test-tag"] = state
+	state.mu.Lock()
+	state.testing = true // stands in for a queued test already running
+	state.mu.Unlock()
+
+	m.probe = func(ctx context.Context, tag string) (adapter.URLTestHistory, error) {
+		return adapter.URLTestHistory{Delay: 7}, nil
+	}
+	his, err := m.TestAndWait(context.Background(), "test-tag", time.Second)
+	if err != nil || his.Delay != 7 {
+		t.Fatalf("the caller must still get an answer: his=%+v err=%v", his, err)
+	}
+	state.mu.Lock()
+	stillTesting := state.testing
+	state.mu.Unlock()
+	if !stillTesting {
+		t.Fatal("the flag belongs to the queued test and must survive")
+	}
+}

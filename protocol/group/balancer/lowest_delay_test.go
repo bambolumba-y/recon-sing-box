@@ -54,7 +54,7 @@ func TestNoLatencySwitchInsideDwell(t *testing.T) {
 		t.Fatalf("after dwell the better server must be selected, got %q", s.Now())
 	}
 	ev := s.Events()
-	if len(ev) == 0 || ev[len(ev)-1].Reason != "better_latency" {
+	if len(ev) == 0 || ev[len(ev)-1].Reason != reasonBetterLatency {
 		t.Fatalf("events = %+v", ev)
 	}
 }
@@ -63,7 +63,7 @@ func TestFailureSwitchIgnoresDwell(t *testing.T) {
 	c := newFakeClock()
 	s := newLD(c, "a", "b")
 	s.UpdateOutboundsInfo(map[string]*adapter.URLTestHistory{"a": measured(100, c.Now()), "b": measured(900, c.Now())})
-	switched, has := s.MarkFailed("a", "dial_error")
+	switched, has := s.MarkFailed("a", reasonDialError)
 	if !switched || !has || s.Now() != "b" {
 		t.Fatalf("switched=%v has=%v now=%q", switched, has, s.Now())
 	}
@@ -76,7 +76,7 @@ func TestUnknownNeverSelectedBlind(t *testing.T) {
 	c := newFakeClock()
 	s := newLD(c, "a", "b", "c")
 	s.UpdateOutboundsInfo(map[string]*adapter.URLTestHistory{"a": measured(100, c.Now())})
-	switched, has := s.MarkFailed("a", "stall")
+	switched, has := s.MarkFailed("a", reasonStall)
 	if switched || has || s.Now() != "a" {
 		t.Fatalf("no measured candidate: must stay on a and report no candidate; switched=%v has=%v now=%q", switched, has, s.Now())
 	}
@@ -102,7 +102,7 @@ func TestSuccessfulProbeClearsFailure(t *testing.T) {
 	c := newFakeClock()
 	s := newLD(c, "a", "b")
 	s.UpdateOutboundsInfo(map[string]*adapter.URLTestHistory{"a": measured(100, c.Now()), "b": measured(200, c.Now())})
-	s.MarkFailed("a", "dial_error")
+	s.MarkFailed("a", reasonDialError)
 	c.Advance(time.Second)
 	s.UpdateOutboundsInfo(map[string]*adapter.URLTestHistory{"a": measured(90, c.Now()), "b": measured(200, c.Now())})
 	if !s.Healthy("a") {
@@ -113,13 +113,13 @@ func TestSuccessfulProbeClearsFailure(t *testing.T) {
 func TestForceSelect(t *testing.T) {
 	c := newFakeClock()
 	s := newLD(c, "a", "b")
-	if !s.ForceSelect("b", "rescue", 120) || s.Now() != "b" {
+	if !s.ForceSelect("b", reasonManual, 120) || s.Now() != "b" {
 		t.Fatalf("force select failed, now=%q", s.Now())
 	}
 	if !s.Healthy("b") {
 		t.Fatal("a forced tag with a delay must be healthy right away")
 	}
-	if s.ForceSelect("zzz", "rescue", 120) {
+	if s.ForceSelect("zzz", reasonManual, 120) {
 		t.Fatal("unknown tag must be rejected")
 	}
 }
@@ -160,7 +160,7 @@ func TestMarkFailedOnNonCurrentTagHasNothingToRescue(t *testing.T) {
 	c := newFakeClock()
 	s := newLD(c, "a", "b")
 	s.UpdateOutboundsInfo(map[string]*adapter.URLTestHistory{"a": measured(100, c.Now()), "b": measured(200, c.Now())})
-	switched, has := s.MarkFailed("b", "dial_error")
+	switched, has := s.MarkFailed("b", reasonDialError)
 	if switched || !has || s.Now() != "a" {
 		t.Fatalf("failure of a non-current tag: switched=%v has=%v now=%q", switched, has, s.Now())
 	}
