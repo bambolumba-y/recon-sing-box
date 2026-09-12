@@ -54,27 +54,28 @@ func Get(ctx context.Context) *OutboundMonitoring {
 
 // OutboundMonitoring orchestrates URL testing and traffic sampling for outbounds.
 type OutboundMonitoring struct {
-	endpointManager  adapter.EndpointManager
-	outboundManager  adapter.OutboundManager
-	logger           log.ContextLogger
-	cache            adapter.CacheFile
-	ctx              context.Context
-	cancel           context.CancelFunc
-	tag              string
-	pause            pause.Manager
-	pauseCallback    *list.Element[pause.Callback]
-	started          bool
-	urls             []string
-	currentLinkIndex atomic.Uint32
-	access           sync.Mutex
-	idleTimeout      time.Duration
-	lastActive       common.TypedValue[time.Time]
-	workersRunning   atomic.Bool
-	mainInterval     time.Duration
-	debounceWindow   time.Duration
-	urlTestTimeout   time.Duration
-	workersCount     int
-	history          adapter.URLTestHistoryStorage
+	endpointManager       adapter.EndpointManager
+	outboundManager       adapter.OutboundManager
+	logger                log.ContextLogger
+	cache                 adapter.CacheFile
+	ctx                   context.Context
+	cancel                context.CancelFunc
+	tag                   string
+	pause                 pause.Manager
+	pauseCallback         *list.Element[pause.Callback]
+	started               bool
+	urls                  []string
+	currentLinkIndex      atomic.Uint32
+	access                sync.Mutex
+	idleTimeout           time.Duration
+	lastActive            common.TypedValue[time.Time]
+	workersRunning        atomic.Bool
+	mainInterval          time.Duration
+	debounceWindow        time.Duration
+	urlTestTimeout        time.Duration
+	workersCount          int
+	history               adapter.URLTestHistoryStorage
+	disableInterfaceSweep bool
 
 	mainTicker *time.Ticker
 
@@ -89,13 +90,47 @@ type OutboundMonitoring struct {
 	cycleSeq     uint64
 	cycleRunning atomic.Bool
 
+	cyclesStarted atomic.Uint64
+	cyclesSkipped atomic.Uint64
+	probesQueued  atomic.Uint64
+	probesDirect  atomic.Uint64
+	probesOK      atomic.Uint64
+	probesFailed  atomic.Uint64
+
 	workerWG    sync.WaitGroup
 	schedulerWG sync.WaitGroup
 	closerOnce  sync.Once
 }
 
+// Stats reports monitoring activity counters, safe for concurrent reads.
+type Stats struct {
+	CyclesStarted, CyclesSkipped                       uint64
+	ProbesQueued, ProbesDirect, ProbesOK, ProbesFailed uint64
+}
+
+// Stats returns a snapshot of the monitoring counters.
+func (m *OutboundMonitoring) Stats() Stats {
+	return Stats{
+		CyclesStarted: m.cyclesStarted.Load(),
+		CyclesSkipped: m.cyclesSkipped.Load(),
+		ProbesQueued:  m.probesQueued.Load(),
+		ProbesDirect:  m.probesDirect.Load(),
+		ProbesOK:      m.probesOK.Load(),
+		ProbesFailed:  m.probesFailed.Load(),
+	}
+}
+
+// SweepEnabled reports whether the periodic sweep ticker is configured to run.
+func (m *OutboundMonitoring) SweepEnabled() bool {
+	return m.mainInterval > 0
+}
+
 // InterfaceUpdated implements [adapter.InterfaceUpdateListener].
 func (m *OutboundMonitoring) InterfaceUpdated() {
+	if m.disableInterfaceSweep {
+		m.cyclesSkipped.Add(1)
+		return
+	}
 	m.startCycleOnce()
 }
 
@@ -200,7 +235,7 @@ func (m *OutboundMonitoring) RoutedPacketConnection(ctx context.Context, conn N.
 
 // NewOutboundMonitoring creates and starts a monitoring instance.
 func NewOutboundMonitoring(ctx context.Context, logger log.ContextLogger, options option.MonitoringOptions) (*OutboundMonitoring, error) {
-	if options.Interval <= 0 {
+	if options.Interval == 0 {
 		options.Interval = badoption.Duration(defaultInterval)
 	}
 	if options.Workers <= 0 {
@@ -230,6 +265,13 @@ func NewOutboundMonitoring(ctx context.Context, logger log.ContextLogger, option
 		history = urltest.NewHistoryStorage()
 	}
 
+	mainInterval := options.Interval.Build()
+	if options.Interval < 0 {
+		// Negative interval disables the periodic sweep; normalize to a single
+		// sentinel value so SweepEnabled/startTimerWorkers only need `<= 0`.
+		mainInterval = -1
+	}
+
 	ctx, cancel := context.WithCancel(ctx)
 	m := &OutboundMonitoring{
 		ctx:             ctx,
@@ -243,11 +285,12 @@ func NewOutboundMonitoring(ctx context.Context, logger log.ContextLogger, option
 
 		history: history,
 
-		mainInterval:   options.Interval.Build(),
-		idleTimeout:    options.IdleTimeout.Build(),
-		workersCount:   options.Workers,
-		urlTestTimeout: options.URLTestTimeout.Build(),
-		debounceWindow: options.DebounceWindow.Build(),
+		mainInterval:          mainInterval,
+		idleTimeout:           options.IdleTimeout.Build(),
+		workersCount:          options.Workers,
+		urlTestTimeout:        options.URLTestTimeout.Build(),
+		debounceWindow:        options.DebounceWindow.Build(),
+		disableInterfaceSweep: options.DisableInterfaceSweep,
 
 		priorityQueue: make(chan *testTask, 1000),
 		normalQueue:   make(chan *testTask, 10000),
@@ -324,6 +367,9 @@ func (m *OutboundMonitoring) Start(stage adapter.StartStage) error {
 }
 
 func (m *OutboundMonitoring) startTimerWorkers() {
+	if m.mainInterval <= 0 {
+		return
+	}
 	if !m.workersRunning.CompareAndSwap(false, true) {
 		return
 	}
@@ -390,6 +436,30 @@ func (m *OutboundMonitoring) testNow(outboundTag string, priority bool) error {
 		}
 	}
 	return nil
+}
+
+// TestAndWait probes one outbound now, bypassing the queues, stores the result like a queued test and
+// returns it. It is the prober used by the balancer's active check and rescue scan.
+func (m *OutboundMonitoring) TestAndWait(ctx context.Context, tag string, timeout time.Duration) (adapter.URLTestHistory, error) {
+	state := m.getState(tag)
+	if state == nil {
+		return adapter.URLTestHistory{}, errors.New("outbound not registered")
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	m.probesDirect.Add(1)
+	his, err := m.tester(ctx, tag)
+
+	m.applyResult(testOutcome{
+		outboundTag: tag,
+		history:     his,
+		err:         err,
+		priority:    true,
+	})
+
+	return his, err
 }
 
 func (m *OutboundMonitoring) testParents(outboundTag string, first bool) {
@@ -510,6 +580,8 @@ func (m *OutboundMonitoring) executeTask(task *testTask) {
 	default:
 	}
 
+	m.probesQueued.Add(1)
+
 	state := m.outbounds[task.outboundTag]
 	if state == nil {
 		return
@@ -623,8 +695,10 @@ func (m *OutboundMonitoring) tester(parent context.Context, tag string) (adapter
 
 func (m *OutboundMonitoring) startCycleOnce() bool {
 	if !m.cycleRunning.CompareAndSwap(false, true) {
+		m.cyclesSkipped.Add(1)
 		return false
 	}
+	m.cyclesStarted.Add(1)
 	go func() {
 		defer m.cycleRunning.Store(false)
 		m.logger.Info("starting regular outbound monitoring cycle")
@@ -744,6 +818,12 @@ func (m *OutboundMonitoring) enqueueTask(task *testTask) bool {
 }
 
 func (m *OutboundMonitoring) applyResult(outcome testOutcome) *adapter.URLTestHistory {
+	if outcome.err != nil {
+		m.probesFailed.Add(1)
+	} else {
+		m.probesOK.Add(1)
+	}
+
 	select {
 	case <-m.ctx.Done():
 		return nil
