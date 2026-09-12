@@ -2,6 +2,7 @@ package balancer
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"strconv"
 	"strings"
@@ -11,6 +12,10 @@ import (
 
 	N "github.com/sagernet/sing/common/network"
 )
+
+// errZeroDelay marks a probe that returned no error and no delay. ForceSelect with a delay of 0
+// would leave the tag unmeasured, so such a result is not a usable rescue answer.
+var errZeroDelay = errors.New("probe returned a zero delay")
 
 // Failure reasons used by the controller itself. Callers may pass their own.
 const (
@@ -40,23 +45,33 @@ type failoverCounters struct {
 }
 
 type failover struct {
-	ctx         context.Context
-	cancel      context.CancelFunc
-	cfg         failoverConfig
-	strategy    *LowestDelay
-	probe       prober
-	logger      failoverLogger
-	onSwitch    func()
-	paused      func() bool
-	resetStalls func()
+	ctx      context.Context
+	cancel   context.CancelFunc
+	cfg      failoverConfig
+	strategy *LowestDelay
+	probe    prober
+	logger   failoverLogger
+	onSwitch func()
 
 	clockMu sync.Mutex
 	now     func() time.Time
 	sleepFn func(ctx context.Context, d time.Duration) error
 
+	// hookMu guards the seams the Balancer installs after construction; the loops read them
+	// from their own goroutines.
+	hookMu      sync.Mutex
+	paused      func() bool
+	resetStalls func()
+
+	// eventsMu serialises draining the strategy event buffer, so a switch is logged once.
+	eventsMu sync.Mutex
+
+	// rescueMu guards the single-flight state, the closed flag and every wg.Add, so no
+	// goroutine is added after stop has started waiting.
 	rescueMu      sync.Mutex
 	rescueRunning atomic.Bool
 	rescueDone    chan struct{} // non-nil while a rescue goroutine is alive
+	closed        bool
 
 	wg       sync.WaitGroup
 	stopOnce sync.Once
@@ -91,9 +106,8 @@ func newFailover(ctx context.Context, cfg failoverConfig, strategy *LowestDelay,
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) error {
-	if d <= 0 {
-		return ctx.Err()
-	}
+	// A non-positive duration lets the timer fire at once; returning early here would turn a
+	// misconfigured interval into a busy loop that never observes cancellation.
 	t := time.NewTimer(d)
 	defer t.Stop()
 	select {
@@ -119,16 +133,36 @@ func (f *failover) setClock(now func() time.Time, sleep func(ctx context.Context
 // setPaused installs the predicate that suspends the active check (the Balancer pauses it while
 // the tunnel is idle or the screen is off).
 func (f *failover) setPaused(paused func() bool) {
-	if paused != nil {
-		f.paused = paused
+	if paused == nil {
+		return
 	}
+	f.hookMu.Lock()
+	f.paused = paused
+	f.hookMu.Unlock()
 }
 
 // setResetStalls installs the hook that clears the stall detector state on an interface change.
 func (f *failover) setResetStalls(reset func()) {
-	if reset != nil {
-		f.resetStalls = reset
+	if reset == nil {
+		return
 	}
+	f.hookMu.Lock()
+	f.resetStalls = reset
+	f.hookMu.Unlock()
+}
+
+func (f *failover) isPaused() bool {
+	f.hookMu.Lock()
+	paused := f.paused
+	f.hookMu.Unlock()
+	return paused()
+}
+
+func (f *failover) runResetStalls() {
+	f.hookMu.Lock()
+	reset := f.resetStalls
+	f.hookMu.Unlock()
+	reset()
 }
 
 func (f *failover) timeNow() time.Time {
@@ -163,6 +197,11 @@ func (f *failover) start() {
 // line. It is safe to call once after start.
 func (f *failover) stop() {
 	f.stopOnce.Do(func() {
+		// closed is raised under rescueMu before the wait, so no goroutine can be added to
+		// the wait group once stop is under way.
+		f.rescueMu.Lock()
+		f.closed = true
+		f.rescueMu.Unlock()
 		f.cancel()
 		f.wg.Wait()
 		f.logDiag()
@@ -174,7 +213,7 @@ func (f *failover) activeCheckLoop() {
 		if err := f.sleep(f.ctx, f.cfg.activeCheckInterval); err != nil {
 			return
 		}
-		if f.paused() {
+		if f.isPaused() {
 			continue
 		}
 		tag := f.strategy.Now()
@@ -201,13 +240,13 @@ func (f *failover) diagLoop() {
 
 // reportFailure is the single entry point for dial errors, stalls and failed probes.
 func (f *failover) reportFailure(tag, reason string) {
-	if reason == reasonStall {
-		f.cStalls.Add(1)
-	}
 	if tag == "" || tag != f.strategy.Now() {
 		// The failure belongs to a server that is no longer selected. Invalidating its
 		// monitoring history is the caller's job; there is nothing to switch here.
 		return
+	}
+	if reason == reasonStall {
+		f.cStalls.Add(1)
 	}
 	switched, hasCandidate := f.strategy.MarkFailed(tag, reason)
 	if switched {
@@ -221,30 +260,27 @@ func (f *failover) reportFailure(tag, reason string) {
 }
 
 // startRescue launches the rescue scan. It is single flight: while a scan runs, further calls do
-// nothing. The flag is released only after the goroutine has fully exited, so a failure reported
-// right after a rescue starts a new one.
+// nothing. The flag and the idle channel are flipped together under rescueMu, so the moment
+// waitIdle reports idle is the moment startRescue starts accepting again: a dial error for the
+// tag a rescue just force-selected is never swallowed.
 func (f *failover) startRescue(reason string) {
 	f.rescueMu.Lock()
-	if f.rescueRunning.Load() {
-		f.rescueMu.Unlock()
-		return
-	}
-	if f.ctx.Err() != nil {
+	if f.closed || f.rescueRunning.Load() {
 		f.rescueMu.Unlock()
 		return
 	}
 	f.rescueRunning.Store(true)
 	done := make(chan struct{})
 	f.rescueDone = done
+	f.wg.Add(1)
 	f.rescueMu.Unlock()
 
-	f.wg.Add(1)
 	go func() {
 		defer func() {
 			f.rescueMu.Lock()
+			f.rescueRunning.Store(false)
 			f.rescueDone = nil
 			f.rescueMu.Unlock()
-			f.rescueRunning.Store(false)
 			close(done)
 			f.wg.Done()
 		}()
@@ -264,6 +300,10 @@ func (f *failover) runRescue(reason string) {
 			return
 		}
 		if f.scanOnce(from, reason, started) {
+			return
+		}
+		if f.ctx.Err() != nil {
+			// The scan was cut short by stop, not by unreachable servers.
 			return
 		}
 		f.cRescueExhausted.Add(1)
@@ -292,12 +332,18 @@ func (f *failover) scanOnce(from, reason string, started time.Time) bool {
 		if !ok {
 			continue
 		}
-		if !f.strategy.ForceSelect(tag, reason, delay) {
+		// The force select and the draining of its events happen under eventsMu, so a
+		// concurrent drainEvents cannot pick those events up and log the same switch a
+		// second time. The explicit line below carries the elapsed time instead.
+		f.eventsMu.Lock()
+		selected := f.strategy.ForceSelect(tag, reason, delay)
+		if selected {
+			f.consumeEventsLocked(false)
+		}
+		f.eventsMu.Unlock()
+		if !selected {
 			continue
 		}
-		// The explicit line below carries the elapsed time, so the events the force select
-		// produced are counted but not logged again.
-		f.consumeEvents(false)
 		f.cRescues.Add(1)
 		f.logSwitchLine(from, tag, reason, f.elapsedMS(started))
 		f.onSwitch()
@@ -350,7 +396,7 @@ func (f *failover) probeOnce(tag string, origin *atomic.Uint64) (uint16, error) 
 	if err != nil || delay == 0 {
 		f.cProbesFailed.Add(1)
 		if err == nil {
-			err = context.DeadlineExceeded
+			err = errZeroDelay
 		}
 		return 0, err
 	}
@@ -361,15 +407,18 @@ func (f *failover) probeOnce(tag string, origin *atomic.Uint64) (uint16, error) 
 // onInterfaceChange resets the stall detector and probes the current server once: a new interface
 // invalidates the sockets, not necessarily the server.
 func (f *failover) onInterfaceChange() {
-	f.resetStalls()
-	if f.ctx.Err() != nil {
-		return
-	}
+	f.runResetStalls()
 	tag := f.strategy.Now()
 	if tag == "" {
 		return
 	}
+	f.rescueMu.Lock()
+	if f.closed {
+		f.rescueMu.Unlock()
+		return
+	}
 	f.wg.Add(1)
+	f.rescueMu.Unlock()
 	go func() {
 		defer f.wg.Done()
 		if _, err := f.probeOnce(tag, &f.cProbesInterface); err != nil {
@@ -383,9 +432,14 @@ func (f *failover) onInterfaceChange() {
 
 // drainEvents logs the strategy switch events as failover lines. Only TCP events are logged; UDP
 // mirrors TCP and is counted only.
-func (f *failover) drainEvents() { f.consumeEvents(true) }
+func (f *failover) drainEvents() {
+	f.eventsMu.Lock()
+	defer f.eventsMu.Unlock()
+	f.consumeEventsLocked(true)
+}
 
-func (f *failover) consumeEvents(log bool) {
+// consumeEventsLocked drains the strategy event buffer. The caller holds eventsMu.
+func (f *failover) consumeEventsLocked(log bool) {
 	for _, ev := range f.strategy.Events() {
 		f.switchMu.Lock()
 		f.switches[ev.Reason]++

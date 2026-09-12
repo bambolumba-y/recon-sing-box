@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -267,5 +268,152 @@ func TestDiagLineHasCountsOnly(t *testing.T) {
 	f.logDiag()
 	if !l.has("diag: current=a probes_active=0") || l.has("http") {
 		t.Fatalf("lines: %v", l.snapshot())
+	}
+}
+
+func TestRescuePicksLowestDelayInBatch(t *testing.T) {
+	f, s, p, _, c := newHarness(t, "a", "b", "c")
+	s.UpdateOutboundsInfo(map[string]*adapter.URLTestHistory{"a": measured(100, c.Now())})
+	// Both candidates fit in one batch of two and both answer; the faster one wins whatever
+	// order Candidates returned them in.
+	p.set("b", 300)
+	p.set("c", 120)
+	f.reportFailure("a", "dial_error")
+	if !f.waitIdle(2 * time.Second) {
+		t.Fatal("rescue did not finish")
+	}
+	if p.count("b") != 1 || p.count("c") != 1 {
+		t.Fatalf("both members of the batch must be probed: %v", p.callList())
+	}
+	if s.Now() != "c" {
+		t.Fatalf("the batch winner must be the lowest delay: now=%q calls=%v", s.Now(), p.callList())
+	}
+}
+
+func TestFailureRightAfterRescueStartsANewRescue(t *testing.T) {
+	f, s, p, _, c := newHarness(t, "a", "b")
+	s.UpdateOutboundsInfo(map[string]*adapter.URLTestHistory{"a": measured(100, c.Now())})
+	gate := make(chan struct{})
+	p.block["b"] = gate
+	f.reportFailure("a", "dial_error")
+	p.set("b", 120)
+	close(gate)
+	if !f.waitIdle(2*time.Second) || s.Now() != "b" {
+		t.Fatalf("first rescue did not select b: now=%q", s.Now())
+	}
+	// b is only synthetically healthy; a dial error arriving right now must not be swallowed
+	// by a single-flight flag that outlives the idle state.
+	before := f.counters()
+	f.reportFailure("b", "dial_error")
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := f.counters(); got.ProbesRescue > before.ProbesRescue && got.RescueExhausted > before.RescueExhausted {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("a second rescue must start: before=%+v after=%+v calls=%v", before, f.counters(), p.callList())
+}
+
+func TestStallsCountedOnlyForTheCurrentTag(t *testing.T) {
+	f, s, _, _, c := newHarness(t, "a", "b")
+	s.UpdateOutboundsInfo(map[string]*adapter.URLTestHistory{"a": measured(100, c.Now()), "b": measured(200, c.Now())})
+	f.reportFailure("b", "stall")
+	if got := f.counters().Stalls; got != 0 {
+		t.Fatalf("a stall on a non-selected server must not be counted: stalls=%d", got)
+	}
+	f.reportFailure("a", "stall")
+	if got := f.counters().Stalls; got != 1 {
+		t.Fatalf("stalls=%d, want 1", got)
+	}
+}
+
+// pausedHarness builds a started controller with a one minute active check and a sleep that
+// counts the active check ticks.
+func pausedHarness(t *testing.T, paused func() bool) (*failover, *scriptedProber, *atomic.Int64) {
+	t.Helper()
+	clock := newFakeClock()
+	strategy := NewLowestDelay(fakeOutbounds("a", "b"), option.BalancerOutboundOptions{
+		ActiveCheckInterval: badoption.Duration(time.Minute), RescueTimeout: badoption.Duration(50 * time.Millisecond),
+	})
+	strategy.setClock(clock.Now)
+	strategy.UpdateOutboundsInfo(map[string]*adapter.URLTestHistory{"a": measured(100, clock.Now()), "b": measured(200, clock.Now())})
+	p := &scriptedProber{delays: map[string]uint16{}, block: map[string]chan struct{}{}}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	f := newFailover(ctx, strategy.cfg, strategy, p, &memLogger{}, func() {})
+	var ticks atomic.Int64
+	f.setClock(clock.Now, func(ctx context.Context, d time.Duration) error {
+		if d == time.Minute {
+			ticks.Add(1)
+		}
+		clock.Advance(d)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Millisecond):
+			return nil
+		}
+	})
+	f.setPaused(paused)
+	return f, p, &ticks
+}
+
+func waitTicks(t *testing.T, ticks *atomic.Int64, want int64) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for ticks.Load() < want && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if ticks.Load() < want {
+		t.Fatalf("active check ticked %d times, want at least %d", ticks.Load(), want)
+	}
+}
+
+func TestPausedActiveCheckDoesNotProbe(t *testing.T) {
+	f, p, ticks := pausedHarness(t, func() bool { return true })
+	f.start()
+	defer f.stop()
+	waitTicks(t, ticks, 3)
+	// Reinstalling the hook while the loop is running is what the Balancer does; the setter
+	// and the loop must not touch the field unsynchronised.
+	f.setPaused(func() bool { return true })
+	f.setResetStalls(func() {})
+	waitTicks(t, ticks, 6)
+	if calls := p.callList(); len(calls) != 0 {
+		t.Fatalf("a paused controller must not probe: %v", calls)
+	}
+}
+
+func TestStopIsIdempotentAndEndsARescueInBackoff(t *testing.T) {
+	f, s, p, _, c := newHarness(t, "a", "b")
+	s.UpdateOutboundsInfo(map[string]*adapter.URLTestHistory{"a": measured(100, c.Now())})
+	f.start()
+	f.reportFailure("a", "dial_error") // b never answers: exhausted, then backoff forever
+	deadline := time.Now().Add(2 * time.Second)
+	for f.counters().RescueExhausted == 0 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if f.counters().RescueExhausted == 0 {
+		t.Fatalf("the rescue never reached the backoff: %v", p.callList())
+	}
+	done := make(chan struct{})
+	go func() {
+		f.stop()
+		f.stop() // idempotent
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("stop did not return while a rescue was parked in backoff")
+	}
+	if !f.waitIdle(time.Second) {
+		t.Fatal("the rescue goroutine outlived stop")
+	}
+	// After stop no new rescue may be launched.
+	f.reportFailure("a", "dial_error")
+	if !f.waitIdle(time.Second) {
+		t.Fatal("a rescue was started after stop")
 	}
 }
