@@ -45,6 +45,10 @@ type failover struct {
 	logger   failoverLogger
 	onSwitch func()
 
+	// readStats is a seam over readProcStats so tests can inject rss/cpu values instead of
+	// reading the real process.
+	readStats func() procStats
+
 	clockMu sync.Mutex
 	now     func() time.Time
 	sleepFn func(ctx context.Context, d time.Duration) error
@@ -96,6 +100,7 @@ func newFailover(ctx context.Context, cfg failoverConfig, strategy *LowestDelay,
 		probe:           probe,
 		logger:          logger,
 		onSwitch:        onSwitch,
+		readStats:       readProcStats,
 		paused:          func() bool { return false },
 		networkPaused:   func() bool { return false },
 		resetStalls:     func() {},
@@ -584,6 +589,13 @@ func (f *failover) logDiag() {
 	for _, reason := range reasons {
 		parts = append(parts, reason+"="+strconv.FormatUint(c.Switches[reason], 10))
 	}
+	// rss_mb and cpu_s are process-resource proxies for memory leaks and battery drain; n/a
+	// keeps the field positions stable for parsers when the platform cannot provide them.
+	rssMB, cpuS := "n/a", "n/a"
+	if ps := f.readStats(); ps.ok {
+		rssMB = strconv.FormatFloat(float64(ps.rssBytes)/(1<<20), 'f', 1, 64)
+		cpuS = strconv.FormatFloat(ps.cpu.Seconds(), 'f', 1, 64)
+	}
 	f.logger.Info(
 		"diag: current=", f.strategy.Now(),
 		" probes_active=", c.ProbesActive,
@@ -595,6 +607,8 @@ func (f *failover) logDiag() {
 		" rescue_exhausted=", c.RescueExhausted,
 		" stalls=", c.Stalls,
 		" stalls_suppressed=", c.StallsSuppressed,
+		" rss_mb=", rssMB,
+		" cpu_s=", cpuS,
 		" switches=", strings.Join(parts, ","),
 	)
 }

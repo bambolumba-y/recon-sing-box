@@ -661,7 +661,27 @@ func TestStallWithFailingProbeSwitches(t *testing.T) {
 func TestDiagLineCarriesSuppressedStalls(t *testing.T) {
 	f, _, _, l, _ := newHarness(t, "a", "b")
 	f.logDiag()
-	if !l.has(" stalls=0 stalls_suppressed=0 switches=") {
+	if !l.has(" stalls=0 stalls_suppressed=0 rss_mb=") {
+		t.Fatalf("lines: %v", l.snapshot())
+	}
+}
+
+func TestDiagLineCarriesProcessStats(t *testing.T) {
+	f, _, _, l, _ := newHarness(t, "a", "b")
+	f.readStats = func() procStats {
+		return procStats{rssBytes: 100 << 20, cpu: 12500 * time.Millisecond, ok: true}
+	}
+	f.logDiag()
+	if !l.has(" rss_mb=100.0 cpu_s=12.5 switches=") {
+		t.Fatalf("lines: %v", l.snapshot())
+	}
+}
+
+func TestDiagLineWithoutProcessStats(t *testing.T) {
+	f, _, _, l, _ := newHarness(t, "a", "b")
+	f.readStats = func() procStats { return procStats{} }
+	f.logDiag()
+	if !l.has(" rss_mb=n/a cpu_s=n/a switches=") {
 		t.Fatalf("lines: %v", l.snapshot())
 	}
 }
