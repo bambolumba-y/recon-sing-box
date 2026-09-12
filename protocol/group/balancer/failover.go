@@ -59,12 +59,13 @@ type failover struct {
 	// eventsMu serialises draining the strategy event buffer, so a switch is logged once.
 	eventsMu sync.Mutex
 
-	// rescueMu guards the single-flight state, the closed flag and every wg.Add, so no
-	// goroutine is added after stop has started waiting.
-	rescueMu      sync.Mutex
-	rescueRunning atomic.Bool
-	rescueDone    chan struct{} // non-nil while a rescue goroutine is alive
-	closed        bool
+	// rescueMu guards the single-flight state, the closed flag, every wg.Add and
+	// confirmingStall, so no goroutine is added after stop has started waiting.
+	rescueMu        sync.Mutex
+	rescueRunning   atomic.Bool
+	rescueDone      chan struct{} // non-nil while a rescue goroutine is alive
+	closed          bool
+	confirmingStall map[string]struct{} // tags with a stall confirmation probe in flight
 
 	wg       sync.WaitGroup
 	stopOnce sync.Once
@@ -88,19 +89,20 @@ func newFailover(ctx context.Context, cfg failoverConfig, strategy *LowestDelay,
 		onSwitch = func() {}
 	}
 	return &failover{
-		ctx:           ctx,
-		cancel:        cancel,
-		cfg:           cfg,
-		strategy:      strategy,
-		probe:         probe,
-		logger:        logger,
-		onSwitch:      onSwitch,
-		paused:        func() bool { return false },
-		networkPaused: func() bool { return false },
-		resetStalls:   func() {},
-		now:           time.Now,
-		sleepFn:       sleepCtx,
-		switches:      map[string]uint64{},
+		ctx:             ctx,
+		cancel:          cancel,
+		cfg:             cfg,
+		strategy:        strategy,
+		probe:           probe,
+		logger:          logger,
+		onSwitch:        onSwitch,
+		paused:          func() bool { return false },
+		networkPaused:   func() bool { return false },
+		resetStalls:     func() {},
+		now:             time.Now,
+		sleepFn:         sleepCtx,
+		switches:        map[string]uint64{},
+		confirmingStall: map[string]struct{}{},
 	}
 }
 
@@ -267,8 +269,13 @@ func (f *failover) reportFailure(tag, reason string) {
 		return
 	}
 	if reason == reasonStall {
+		if !f.confirmStall(tag) {
+			// A confirmation for this tag is already running; the stall tracker fired
+			// again before it finished. Dropped, not counted: it would only race the
+			// probe already in flight, not add information.
+			return
+		}
 		f.cStalls.Add(1)
-		f.confirmStall(tag)
 		return
 	}
 	f.handleFailure(tag, reason)
@@ -280,8 +287,24 @@ func (f *failover) reportFailure(tag, reason string) {
 // selection, and the switch (a reconnect for every live connection) is not paid for nothing.
 // The probe is charged to ProbesActive: like the active check, it is the controller checking the
 // server it is already on.
-func (f *failover) confirmStall(tag string) {
+//
+// confirmStall is single-flight per tag: it reports whether it started a new confirmation, so a
+// stall reported for a tag whose confirmation is already running can be dropped by the caller.
+func (f *failover) confirmStall(tag string) bool {
+	f.rescueMu.Lock()
+	if _, running := f.confirmingStall[tag]; running {
+		f.rescueMu.Unlock()
+		return false
+	}
+	f.confirmingStall[tag] = struct{}{}
+	f.rescueMu.Unlock()
+
 	f.spawn(func() {
+		defer func() {
+			f.rescueMu.Lock()
+			delete(f.confirmingStall, tag)
+			f.rescueMu.Unlock()
+		}()
 		if _, err := f.probeOnce(tag, &f.cProbesActive); err == nil {
 			f.cStallsSuppressed.Add(1)
 			return
@@ -295,6 +318,7 @@ func (f *failover) confirmStall(tag string) {
 		}
 		f.handleFailure(tag, reasonStall)
 	})
+	return true
 }
 
 // handleFailure is the switch-or-rescue half of reportFailure, reached directly for every reason

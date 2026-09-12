@@ -191,3 +191,38 @@ func TestTestAndWaitDoesNotClobberAnotherTest(t *testing.T) {
 		t.Fatal("the flag belongs to the queued test and must survive")
 	}
 }
+
+// TestTestAndWaitClearsTestingOnProbePanic pins the fix for a stuck testing flag: if the probe
+// panics, the clear must still run, or collectCycleTargets skips the tag on every later sweep.
+func TestTestAndWaitClearsTestingOnProbePanic(t *testing.T) {
+	m := newTestMonitor(t, option.MonitoringOptions{})
+	m.outbounds["test-tag"] = &outboundState{}
+
+	m.probe = func(ctx context.Context, tag string) (adapter.URLTestHistory, error) {
+		panic("probe blew up")
+	}
+
+	func() {
+		defer func() { recover() }()
+		m.TestAndWait(context.Background(), "test-tag", time.Second)
+	}()
+
+	m.outbounds["test-tag"].mu.Lock()
+	stillTesting := m.outbounds["test-tag"].testing
+	m.outbounds["test-tag"].mu.Unlock()
+	if stillTesting {
+		t.Fatal("the testing flag must be cleared even when the probe panics")
+	}
+
+	contains := func(tags []string, want string) bool {
+		for _, tag := range tags {
+			if tag == want {
+				return true
+			}
+		}
+		return false
+	}
+	if !contains(m.collectCycleTargets(), "test-tag") {
+		t.Fatal("the tag must still be a sweep target after the panic")
+	}
+}

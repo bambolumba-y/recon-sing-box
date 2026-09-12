@@ -464,6 +464,13 @@ func (m *OutboundMonitoring) TestAndWait(ctx context.Context, tag string, timeou
 		state.testing = true
 	}
 	state.mu.Unlock()
+	if markedTesting {
+		defer func() {
+			state.mu.Lock()
+			state.testing = false
+			state.mu.Unlock()
+		}()
+	}
 
 	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -488,12 +495,6 @@ func (m *OutboundMonitoring) TestAndWait(ctx context.Context, tag string, timeou
 		err:         err,
 		priority:    true,
 	})
-
-	if markedTesting {
-		state.mu.Lock()
-		state.testing = false
-		state.mu.Unlock()
-	}
 
 	return his, err
 }

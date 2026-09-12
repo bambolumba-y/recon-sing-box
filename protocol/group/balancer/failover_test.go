@@ -606,6 +606,38 @@ func TestStallWithHealthyProbeIsSuppressed(t *testing.T) {
 	}
 }
 
+// TestStallConfirmationIsSingleFlight pins the fix for a duplicate confirmation probe: the stall
+// tracker can fire again for the same tag while its first confirmation is still in flight, and
+// the second report must be dropped rather than spawn a parallel probe.
+func TestStallConfirmationIsSingleFlight(t *testing.T) {
+	f, s, p, _, c := newHarness(t, "a", "b")
+	s.UpdateOutboundsInfo(map[string]*adapter.URLTestHistory{"a": measured(100, c.Now()), "b": measured(200, c.Now())})
+	gate := make(chan struct{})
+	p.block["a"] = gate
+	p.set("a", 90) // the confirmation succeeds once released, so the selection is kept
+
+	f.reportFailure("a", reasonStall)
+	f.reportFailure("a", reasonStall)
+
+	close(gate)
+	if !f.waitIdle(3 * time.Second) {
+		t.Fatal("the confirmation probe did not finish")
+	}
+
+	if p.count("a") != 1 {
+		t.Fatalf("the duplicate stall report must not start a second probe, calls=%v", p.callList())
+	}
+	if got := f.counters(); got.Stalls != 1 {
+		t.Fatalf("Stalls = %d, want 1 (the dropped duplicate must not be counted)", got.Stalls)
+	}
+	if got := f.counters().StallsSuppressed; got != 1 {
+		t.Fatalf("StallsSuppressed = %d, want 1", got)
+	}
+	if s.Now() != "a" {
+		t.Fatalf("a confirmed-alive server must keep the selection, now=%q", s.Now())
+	}
+}
+
 func TestStallWithFailingProbeSwitches(t *testing.T) {
 	f, s, p, l, c := newHarness(t, "a", "b")
 	s.UpdateOutboundsInfo(map[string]*adapter.URLTestHistory{"a": measured(100, c.Now()), "b": measured(200, c.Now())})
