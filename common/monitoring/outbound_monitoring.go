@@ -76,6 +76,9 @@ type OutboundMonitoring struct {
 	workersCount          int
 	history               adapter.URLTestHistoryStorage
 	disableInterfaceSweep bool
+	// probe is the seam used to run a single outbound test; both the queue path
+	// (executeTask) and TestAndWait call it. Defaults to m.tester, overridable in tests.
+	probe func(ctx context.Context, tag string) (adapter.URLTestHistory, error)
 
 	mainTicker *time.Ticker
 
@@ -297,6 +300,7 @@ func NewOutboundMonitoring(ctx context.Context, logger log.ContextLogger, option
 		outbounds:     make(map[string]*outboundState),
 		groups:        make(map[string]*groupState),
 	}
+	m.probe = m.tester
 
 	return m, nil
 }
@@ -441,16 +445,31 @@ func (m *OutboundMonitoring) testNow(outboundTag string, priority bool) error {
 // TestAndWait probes one outbound now, bypassing the queues, stores the result like a queued test and
 // returns it. It is the prober used by the balancer's active check and rescue scan.
 func (m *OutboundMonitoring) TestAndWait(ctx context.Context, tag string, timeout time.Duration) (adapter.URLTestHistory, error) {
+	if m.ctx.Err() != nil {
+		return adapter.URLTestHistory{}, m.ctx.Err()
+	}
+
 	state := m.getState(tag)
 	if state == nil {
 		return adapter.URLTestHistory{}, errors.New("outbound not registered")
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	// Cancel the probe early if the monitor itself shuts down mid-flight, so Close()
+	// is never left waiting behind an in-flight network probe. probeCtx.Done() (from
+	// the timeout, the caller ctx, or the deferred cancel above) stops this goroutine.
+	go func() {
+		select {
+		case <-m.ctx.Done():
+			cancel()
+		case <-probeCtx.Done():
+		}
+	}()
+
 	m.probesDirect.Add(1)
-	his, err := m.tester(ctx, tag)
+	his, err := m.probe(probeCtx, tag)
 
 	m.applyResult(testOutcome{
 		outboundTag: tag,
@@ -617,7 +636,7 @@ func (m *OutboundMonitoring) executeTask(task *testTask) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		delay, err := m.tester(m.ctx, task.outboundTag)
+		delay, err := m.probe(m.ctx, task.outboundTag)
 
 		outcome := testOutcome{
 			outboundTag: task.outboundTag,
@@ -672,14 +691,19 @@ func (m *OutboundMonitoring) tester(parent context.Context, tag string) (adapter
 		return his, parent.Err()
 	default:
 	}
-	if out.history.IpInfo == nil || out.from_cache {
+	out.mu.Lock()
+	cachedIpInfo := out.history.IpInfo
+	fromCache := out.from_cache
+	out.mu.Unlock()
+
+	if cachedIpInfo == nil || fromCache {
 
 		ctx, cancel2 := context.WithTimeout(parent, m.urlTestTimeout)
 		defer cancel2()
 
 		newip, t, err := ipinfo.GetIpInfo(m.logger, ctx, out.outbound)
 		if err == nil {
-			his.IpInfo = mergeIpInfo(out.history.IpInfo, newip)
+			his.IpInfo = mergeIpInfo(cachedIpInfo, newip)
 			if t < his.Delay {
 				his.Delay = t
 			}
@@ -923,8 +947,8 @@ func (m *OutboundMonitoring) Touch() {
 	}
 	m.access.Lock()
 	defer m.access.Unlock()
+	m.lastActive.Store(time.Now())
 	if m.mainTicker != nil {
-		m.lastActive.Store(time.Now())
 		return
 	}
 	m.startTimerWorkers()

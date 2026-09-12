@@ -2,9 +2,11 @@ package monitoring
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json/badoption"
@@ -50,5 +52,67 @@ func TestTestAndWaitUnknownTag(t *testing.T) {
 	m := newTestMonitor(t, option.MonitoringOptions{})
 	if _, err := m.TestAndWait(context.Background(), "nope", time.Second); err == nil {
 		t.Fatal("unknown tag must return an error")
+	}
+}
+
+func TestTestAndWaitProbePathAndCounters(t *testing.T) {
+	m := newTestMonitor(t, option.MonitoringOptions{})
+	m.outbounds["test-tag"] = &outboundState{}
+
+	fixedHistory := adapter.URLTestHistory{Delay: 42}
+	probeErr := errors.New("probe failed")
+	calls := 0
+	m.probe = func(ctx context.Context, tag string) (adapter.URLTestHistory, error) {
+		calls++
+		if calls == 1 {
+			return fixedHistory, nil
+		}
+		return adapter.URLTestHistory{}, probeErr
+	}
+
+	his, err := m.TestAndWait(context.Background(), "test-tag", time.Second)
+	if err != nil {
+		t.Fatalf("first call: unexpected error %v", err)
+	}
+	if his.Delay != fixedHistory.Delay {
+		t.Fatalf("first call: history = %+v, want delay %v", his, fixedHistory.Delay)
+	}
+
+	_, err = m.TestAndWait(context.Background(), "test-tag", time.Second)
+	if !errors.Is(err, probeErr) {
+		t.Fatalf("second call: err = %v, want %v", err, probeErr)
+	}
+
+	s := m.Stats()
+	if s.ProbesDirect != 2 {
+		t.Fatalf("ProbesDirect = %d, want 2", s.ProbesDirect)
+	}
+	if s.ProbesOK != 1 {
+		t.Fatalf("ProbesOK = %d, want 1", s.ProbesOK)
+	}
+	if s.ProbesFailed != 1 {
+		t.Fatalf("ProbesFailed = %d, want 1", s.ProbesFailed)
+	}
+}
+
+func TestTestAndWaitAfterCloseReturnsError(t *testing.T) {
+	m := newTestMonitor(t, option.MonitoringOptions{})
+	m.outbounds["test-tag"] = &outboundState{}
+
+	probeCalls := 0
+	m.probe = func(ctx context.Context, tag string) (adapter.URLTestHistory, error) {
+		probeCalls++
+		return adapter.URLTestHistory{}, nil
+	}
+
+	if err := m.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if _, err := m.TestAndWait(context.Background(), "test-tag", time.Second); err == nil {
+		t.Fatal("TestAndWait after Close must return an error")
+	}
+	if probeCalls != 0 {
+		t.Fatalf("probe must not run after Close, got %d calls", probeCalls)
 	}
 }
