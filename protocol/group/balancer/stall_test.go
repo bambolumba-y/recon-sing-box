@@ -105,6 +105,66 @@ func TestOtherTagAndClosedConnsIgnored(t *testing.T) {
 	}
 }
 
+// TestReadClearsWindowOnlyForCurrentTag guards against a conn left over from
+// a previous server (still draining after a switch) masking a stall on the
+// new current server just because it happens to receive data.
+func TestReadClearsWindowOnlyForCurrentTag(t *testing.T) {
+	setup := func() (tr *stallTracker, fired *[]string, clock *fakeClock, wa, pa, wb1, pb1 net.Conn) {
+		clock = newFakeClock()
+		var f []string
+		cfg := normalizeFailover(optionWith(8*time.Second, 2, 30*time.Second))
+		tr = newStallTracker(cfg, clock.Now, func(tag string) { f = append(f, tag) })
+		fired = &f
+
+		ca, pa2 := net.Pipe()
+		wa = tr.wrap(ca, "a")
+		pa = pa2
+
+		cb1, pb12 := net.Pipe()
+		wb1 = tr.wrap(cb1, "b")
+		pb1 = pb12
+
+		tr.tick("b") // tracker learns "b" is current before anything stalls
+
+		go wb1.Write([]byte("x"))
+		pb1.Read(make([]byte, 1))
+		time.Sleep(10 * time.Millisecond)
+		clock.Advance(9 * time.Second)
+		tr.tick("b") // one stall recorded for "b", below threshold 2
+		return
+	}
+
+	secondStall := func(tr *stallTracker, clock *fakeClock) {
+		cb2, pb2 := net.Pipe()
+		wb2 := tr.wrap(cb2, "b")
+		go wb2.Write([]byte("x"))
+		pb2.Read(make([]byte, 1))
+		time.Sleep(10 * time.Millisecond)
+		clock.Advance(9 * time.Second)
+		tr.tick("b")
+	}
+
+	t.Run("read on a non-current tag does not clear the window", func(t *testing.T) {
+		tr, fired, clock, wa, pa, _, _ := setup()
+		go pa.Write([]byte("y"))
+		wa.Read(make([]byte, 1)) // a read on tag "a" while "b" is current
+		secondStall(tr, clock)
+		if len(*fired) != 1 || (*fired)[0] != "b" {
+			t.Fatalf("a read on a non-current tag must not clear the current tag's window, got %v", *fired)
+		}
+	})
+
+	t.Run("read on the current tag clears the window", func(t *testing.T) {
+		tr, fired, clock, _, _, wb1, pb1 := setup()
+		go pb1.Write([]byte("y"))
+		wb1.Read(make([]byte, 1)) // a read on tag "b" while "b" is current
+		secondStall(tr, clock)
+		if len(*fired) != 0 {
+			t.Fatalf("a read on the current tag must clear the window, got %v", *fired)
+		}
+	})
+}
+
 func optionWith(timeout time.Duration, threshold int, window time.Duration) option.BalancerOutboundOptions {
 	return option.BalancerOutboundOptions{
 		StallTimeout: badoption.Duration(timeout), StallThreshold: threshold, StallWindow: badoption.Duration(window),

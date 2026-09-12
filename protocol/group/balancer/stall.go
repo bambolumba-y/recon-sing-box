@@ -12,10 +12,11 @@ type stallTracker struct {
 	now     func() time.Time
 	onStall func(tag string)
 
-	mu       sync.Mutex
-	conns    map[*stallConn]struct{}
-	stalls   []time.Time
-	readSeen atomic.Bool
+	mu         sync.Mutex
+	conns      map[*stallConn]struct{}
+	stalls     []time.Time
+	readSeen   atomic.Bool
+	currentTag atomic.Pointer[string] // last tag passed to tick; nil before the first tick
 }
 
 type stallConn struct {
@@ -53,6 +54,8 @@ func (t *stallTracker) reset() {
 
 func (t *stallTracker) tick(currentTag string) {
 	now := t.now()
+	tag := currentTag
+	t.currentTag.Store(&tag) // remember it so Read can tell whether a conn belongs to the current server
 	t.mu.Lock()
 	if t.readSeen.Swap(false) {
 		t.stalls = nil
@@ -111,7 +114,13 @@ func (c *stallConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
 	if n > 0 {
 		c.readSinceWrite.Add(int64(n))
-		c.tracker.readSeen.Store(true)
+		// Only a read on a conn of the tag tick last saw as current means the
+		// current server is alive. A read on a conn left over from a previous
+		// tag (e.g. draining after a switch) must not mask a stalled current
+		// server, so it must not clear the window.
+		if cur := c.tracker.currentTag.Load(); cur != nil && *cur == c.tag {
+			c.tracker.readSeen.Store(true)
+		}
 	}
 	return n, err
 }
