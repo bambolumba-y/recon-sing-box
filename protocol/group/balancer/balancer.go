@@ -64,6 +64,10 @@ type Balancer struct {
 	failover  *failover
 	stalls    *stallTracker
 	closeOnce sync.Once
+
+	// foStrategy is the strategy behind strategyFn when it can drive the failover controller
+	// (lowest-delay and throughput). It is nil for the other strategies.
+	foStrategy failoverStrategy
 }
 
 // monitorProber adapts the outbound monitoring to the prober the failover controller needs.
@@ -127,15 +131,18 @@ func (s *Balancer) Start() error {
 		return E.New("unknown load balance strategy: ", s.options.Strategy)
 	}
 
+	if fs, ok := s.strategyFn.(failoverStrategy); ok {
+		s.foStrategy = fs
+	}
 	// The controller probes through the monitor and the worker reads its history; without a
 	// monitor there is nothing to drive either, so neither is built.
-	if s.options.Strategy == StrategyLowestDelay && s.monitor != nil {
-		ld := s.strategyFn.(*LowestDelay)
-		s.stalls = newStallTracker(ld.cfg, time.Now, func(tag string) {
+	if s.foStrategy != nil && s.monitor != nil {
+		cfg := s.foStrategy.config()
+		s.stalls = newStallTracker(cfg, time.Now, func(tag string) {
 			// reportFailure owns the Stalls counter; do not bump it here.
 			s.failover.reportFailure(tag, reasonStall)
 		})
-		s.failover = newFailover(s.ctx, ld.cfg, ld, monitorProber{s.monitor}, s.logger, func() {
+		s.failover = newFailover(s.ctx, cfg, s.foStrategy, monitorProber{s.monitor}, s.logger, func() {
 			s.interruptGroup.Interrupt(s.interruptExternalConnections)
 		})
 		s.failover.setResetStalls(s.stalls.reset)
@@ -146,10 +153,10 @@ func (s *Balancer) Start() error {
 			s.failover.setNetworkPaused(pm.IsNetworkPaused)
 		}
 	}
-	if s.options.Strategy == StrategyLowestDelay && s.monitor == nil {
+	if s.foStrategy != nil && s.monitor == nil {
 		// Without the monitor there is no prober and no history, so nothing can detect or
 		// repair a dead server. Say it once instead of failing silently.
-		s.logger.Warn("load balance: failover is disabled, outbound monitoring is off")
+		s.logger.Warn("load balance: failover is disabled for strategy ", s.options.Strategy, ", outbound monitoring is off")
 	}
 
 	return nil

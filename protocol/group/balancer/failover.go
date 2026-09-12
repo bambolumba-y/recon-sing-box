@@ -40,7 +40,7 @@ type failover struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	cfg      failoverConfig
-	strategy *LowestDelay
+	strategy failoverStrategy
 	probe    prober
 	logger   failoverLogger
 	onSwitch func()
@@ -87,7 +87,7 @@ type failover struct {
 	switches map[string]uint64
 }
 
-func newFailover(ctx context.Context, cfg failoverConfig, strategy *LowestDelay, probe prober, logger failoverLogger, onSwitch func()) *failover {
+func newFailover(ctx context.Context, cfg failoverConfig, strategy failoverStrategy, probe prober, logger failoverLogger, onSwitch func()) *failover {
 	ctx, cancel := context.WithCancel(ctx)
 	if onSwitch == nil {
 		onSwitch = func() {}

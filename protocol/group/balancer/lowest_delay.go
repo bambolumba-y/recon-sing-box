@@ -27,6 +27,7 @@ type LowestDelay struct {
 	history     map[string]*adapter.URLTestHistory
 	failedAt    map[string]time.Time
 	events      []switchEvent
+	rk          ranker
 	mu          sync.Mutex
 }
 
@@ -38,7 +39,7 @@ func NewLowestDelay(outbounds []adapter.Outbound, options option.BalancerOutboun
 	for _, o := range outbounds {
 		byTag[o.Tag()] = o
 	}
-	return &LowestDelay{
+	s := &LowestDelay{
 		outbounds: couts,
 		byTag:     byTag,
 		selected: map[string]adapter.Outbound{
@@ -51,6 +52,38 @@ func NewLowestDelay(outbounds []adapter.Outbound, options option.BalancerOutboun
 		history:     map[string]*adapter.URLTestHistory{},
 		failedAt:    map[string]time.Time{},
 	}
+	s.rk = latencyRanker{s}
+	return s
+}
+
+// setRanker installs the candidate ordering. Throughput replaces the default latency ranker with
+// one that puts measured bandwidth first.
+func (s *LowestDelay) setRanker(r ranker) { s.mu.Lock(); s.rk = r; s.mu.Unlock() }
+
+// lock and unlock expose the strategy lock to the throughput value table, which lives in another
+// type but must be read by the ranker while this lock is already held. One lock, because two
+// would be a lock-order cycle.
+func (s *LowestDelay) lock()   { s.mu.Lock() }
+func (s *LowestDelay) unlock() { s.mu.Unlock() }
+
+// config returns the normalised failover config. It is immutable after construction.
+func (s *LowestDelay) config() failoverConfig { return s.cfg }
+
+func (s *LowestDelay) outboundByTag(tag string) adapter.Outbound {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.byTag[tag]
+}
+
+// latencyRanker is the default ranker: the behaviour LowestDelay had before the seam existed.
+type latencyRanker struct{ ld *LowestDelay }
+
+func (r latencyRanker) best(network, exclude string) (adapter.Outbound, uint16) {
+	return r.ld.bestByLatencyLocked(network, exclude)
+}
+
+func (r latencyRanker) order(exclude string) []string {
+	return r.ld.orderByLatencyLocked(exclude)
 }
 
 func (s *LowestDelay) setClock(now func() time.Time) { s.mu.Lock(); s.now = now; s.mu.Unlock() }
@@ -58,7 +91,16 @@ func (s *LowestDelay) setClock(now func() time.Time) { s.mu.Lock(); s.now = now;
 func (s *LowestDelay) Now() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.selected[N.NetworkTCP].Tag()
+	return s.currentLocked()
+}
+
+// currentLocked is the TCP selection. The caller holds s.mu.
+func (s *LowestDelay) currentLocked() string {
+	cur := s.selected[N.NetworkTCP]
+	if cur == nil {
+		return ""
+	}
+	return cur.Tag()
 }
 
 // IsSelected reports whether tag is the current selection for TCP or for UDP. A failure on a tag
@@ -118,8 +160,14 @@ func (s *LowestDelay) Healthy(tag string) bool {
 	return s.healthyLocked(tag)
 }
 
-// bestLocked returns the healthy outbound with the lowest delay for network, excluding tag.
+// bestLocked asks the installed ranker for the best candidate.
 func (s *LowestDelay) bestLocked(network, exclude string) (adapter.Outbound, uint16) {
+	return s.rk.best(network, exclude)
+}
+
+// bestByLatencyLocked returns the healthy outbound with the lowest delay for network, excluding
+// tag. This is the body bestLocked used to have.
+func (s *LowestDelay) bestByLatencyLocked(network, exclude string) (adapter.Outbound, uint16) {
 	var best adapter.Outbound
 	bestDelay := monitoring.TimeoutDelay
 	for _, o := range s.outbounds[network] {
@@ -151,50 +199,99 @@ func (s *LowestDelay) switchLocked(network string, to adapter.Outbound, reason s
 	}
 }
 
-func (s *LowestDelay) UpdateOutboundsInfo(history map[string]*adapter.URLTestHistory) bool {
+// ingest copies the monitoring history into the strategy.
+func (s *LowestDelay) ingest(history map[string]*adapter.URLTestHistory) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.ingestLocked(history)
+}
+
+func (s *LowestDelay) ingestLocked(history map[string]*adapter.URLTestHistory) {
 	for tag, h := range history {
 		if h != nil {
 			copyH := *h
 			s.history[tag] = &copyH
 		}
 	}
+}
+
+// promoteHealthy replaces a provisional or unhealthy selection with the ranker's best candidate,
+// for both networks. It is the arm that must run for every strategy: a dead or unmeasured server
+// is never kept.
+func (s *LowestDelay) promoteHealthy() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.promoteHealthyLocked(s.now(), s.provisional)
+}
+
+// promoteHealthyLocked takes wasProvisional as a snapshot: the TCP iteration clears the flag and
+// UDP must still see the state the update started from.
+func (s *LowestDelay) promoteHealthyLocked(now time.Time, wasProvisional bool) bool {
 	changed := false
-	now := s.now()
-	// The dwell decision is taken once for the whole update: switchLocked moves lastSwitch
-	// on the TCP iteration, and without a snapshot UDP would stay behind for a full dwell.
-	dwellOK := now.Sub(s.lastSwitch) >= s.cfg.minDwell
-	// Same reason: the TCP iteration clears provisional, UDP must still see the state
-	// the update started from.
-	wasProvisional := s.provisional
 	for _, network := range []string{N.NetworkTCP, N.NetworkUDP} {
 		cur := s.selected[network]
+		if cur != nil && !wasProvisional && s.healthyLocked(cur.Tag()) {
+			continue
+		}
+		best, _ := s.bestLocked(network, "")
+		if best == nil {
+			continue
+		}
+		if cur == nil || best.Tag() != cur.Tag() {
+			reason := reasonProbeFailed
+			if wasProvisional {
+				reason = reasonInitial
+			}
+			s.switchLocked(network, best, reason)
+			changed = true
+		} else if network == N.NetworkTCP {
+			// The provisional pick turned out to be the best measured server: it stops
+			// being provisional and starts the dwell window from now.
+			s.provisional = false
+			s.lastSwitch = now
+		}
+	}
+	return changed
+}
+
+func (s *LowestDelay) sinceLastSwitch(now time.Time) time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sinceLastSwitchLocked(now)
+}
+
+func (s *LowestDelay) sinceLastSwitchLocked(now time.Time) time.Duration {
+	return now.Sub(s.lastSwitch)
+}
+
+func (s *LowestDelay) UpdateOutboundsInfo(history map[string]*adapter.URLTestHistory) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ingestLocked(history)
+	now := s.now()
+	// The dwell decision is taken once for the whole update: switchLocked moves lastSwitch on
+	// the TCP iteration, and without a snapshot UDP would stay behind for a full dwell.
+	dwellOK := s.sinceLastSwitchLocked(now) >= s.cfg.minDwell
+	wasProvisional := s.provisional
+	changed := s.promoteHealthyLocked(now, wasProvisional)
+	if wasProvisional {
+		// Every network took the promote arm; the tolerance arm has nothing to add.
+		return changed
+	}
+	for _, network := range []string{N.NetworkTCP, N.NetworkUDP} {
+		cur := s.selected[network]
+		if cur == nil || !s.healthyLocked(cur.Tag()) {
+			// Handled by promoteHealthyLocked, or nothing healthy exists to move to.
+			continue
+		}
 		best, bestDelay := s.bestLocked(network, "")
 		if best == nil {
 			continue
 		}
-		switch {
-		case wasProvisional || !s.healthyLocked(cur.Tag()):
-			if best.Tag() != cur.Tag() {
-				reason := reasonProbeFailed
-				if wasProvisional {
-					reason = reasonInitial
-				}
-				s.switchLocked(network, best, reason)
-				changed = true
-			} else if network == N.NetworkTCP {
-				// The provisional pick turned out to be the best measured server: it stops
-				// being provisional and starts the dwell window from now.
-				s.provisional = false
-				s.lastSwitch = now
-			}
-		default:
-			curDelay, _ := s.measuredLocked(cur.Tag())
-			if uint32(bestDelay)+uint32(s.cfg.tolerance) < uint32(curDelay) && dwellOK {
-				s.switchLocked(network, best, reasonBetterLatency)
-				changed = true
-			}
+		curDelay, _ := s.measuredLocked(cur.Tag())
+		if uint32(bestDelay)+uint32(s.cfg.tolerance) < uint32(curDelay) && dwellOK {
+			s.switchLocked(network, best, reasonBetterLatency)
+			changed = true
 		}
 	}
 	return changed
@@ -249,11 +346,25 @@ func (s *LowestDelay) ForceSelect(tag, reason string, delay uint16) bool {
 	return true
 }
 
-// Candidates lists all tags except exclude: healthy measured first by delay, then unknown/failed in
-// configuration order.
+// Candidates lists all tags except exclude in the order the installed ranker decides.
 func (s *LowestDelay) Candidates(exclude string) []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.rk.order(exclude)
+}
+
+// orderByLatency is Candidates with the latency order forced, whatever ranker is installed. The
+// throughput shortlist uses it: measuring only the servers that already have the best values
+// would never discover a faster one.
+func (s *LowestDelay) orderByLatency(exclude string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.orderByLatencyLocked(exclude)
+}
+
+// orderByLatencyLocked lists all tags except exclude: healthy measured first by delay, then
+// unknown or failed in configuration order. This is the body Candidates used to have.
+func (s *LowestDelay) orderByLatencyLocked(exclude string) []string {
 	var measuredTags, unknownTags []string
 	delays := map[string]uint16{}
 	for _, o := range s.outbounds[N.NetworkTCP] {
