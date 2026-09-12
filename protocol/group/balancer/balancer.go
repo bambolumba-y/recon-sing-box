@@ -127,7 +127,9 @@ func (s *Balancer) Start() error {
 		return E.New("unknown load balance strategy: ", s.options.Strategy)
 	}
 
-	if s.options.Strategy == StrategyLowestDelay {
+	// The controller probes through the monitor and the worker reads its history; without a
+	// monitor there is nothing to drive either, so neither is built.
+	if s.options.Strategy == StrategyLowestDelay && s.monitor != nil {
 		ld := s.strategyFn.(*LowestDelay)
 		s.stalls = newStallTracker(ld.cfg, time.Now, func(tag string) {
 			// reportFailure owns the Stalls counter; do not bump it here.
@@ -175,6 +177,9 @@ func (s *Balancer) stallLoop() {
 }
 
 func (s *Balancer) worker() {
+	if s.monitor == nil {
+		return
+	}
 	observer, err := s.monitor.SubscribeGroup(s.Tag())
 	if err != nil {
 		s.logger.Error("failed to observe monitoring group: ", err)
@@ -204,6 +209,7 @@ func (s *Balancer) worker() {
 		}
 	}
 }
+
 // InterfaceUpdated implements [adapter.InterfaceUpdateListener].
 func (s *Balancer) InterfaceUpdated() {
 	if s.failover != nil {
@@ -259,7 +265,7 @@ func (s *Balancer) DialContext(ctx context.Context, network string, destination 
 	s.logger.ErrorContext(ctx, err)
 	s.monitor.InvalidateTest(outbound.Tag())
 	if s.failover != nil {
-		s.failover.reportFailure(outbound.Tag(), "dial_error")
+		s.failover.reportFailure(outbound.Tag(), reasonDialError)
 	}
 
 	return nil, err

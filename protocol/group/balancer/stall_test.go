@@ -1,23 +1,18 @@
 package balancer
 
 import (
+	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/sagernet/sing-box/common/interrupt"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common/bufio"
 	"github.com/sagernet/sing/common/json/badoption"
+	N "github.com/sagernet/sing/common/network"
 )
-
-type scriptConn struct {
-	net.Conn
-	readCh chan []byte
-}
-
-func newScriptConn() (*scriptConn, net.Conn) {
-	a, b := net.Pipe()
-	return &scriptConn{Conn: a}, b
-}
 
 func newTracker(clock *fakeClock) (*stallTracker, *[]string) {
 	var fired []string
@@ -169,4 +164,85 @@ func optionWith(timeout time.Duration, threshold int, window time.Duration) opti
 	return option.BalancerOutboundOptions{
 		StallTimeout: badoption.Duration(timeout), StallThreshold: threshold, StallWindow: badoption.Duration(window),
 	}
+}
+
+// TestStallConnUnwrapsToSocketKeepingCounters pins the reason stallConn is built on sing's
+// counter contract: bufio.Copy must be able to unwrap interrupt.Conn -> stallConn down to the
+// raw socket (so splice, the read waiter and vectorised writes survive) while still collecting
+// the stall bookkeeping as N.CountFunc.
+func TestStallConnUnwrapsToSocketKeepingCounters(t *testing.T) {
+	clock := newFakeClock()
+	tr, _ := newTracker(clock)
+	socket, peer := net.Pipe()
+	defer socket.Close()
+	defer peer.Close()
+	wrapped := tr.wrap(socket, "a")
+	top := interrupt.NewGroup().NewConn(wrapped, false)
+
+	// The plain (non-counting) unwrap is what CastReader uses to find the splice path and the
+	// read waiter, and it only descends through a wrapper that declares itself replaceable.
+	if plain := N.UnwrapReader(top); plain != io.Reader(socket) {
+		t.Fatalf("N.UnwrapReader must reach the socket, got %T", plain)
+	}
+	if plain := N.UnwrapWriter(top); plain != io.Writer(socket) {
+		t.Fatalf("N.UnwrapWriter must reach the socket, got %T", plain)
+	}
+
+	reader, readCounters := N.UnwrapCountReader(top, nil)
+	if reader != io.Reader(socket) {
+		t.Fatalf("reader must unwrap to the socket, got %T", reader)
+	}
+	if len(readCounters) != 1 {
+		t.Fatalf("the stall read counter must survive unwrapping, got %d counters", len(readCounters))
+	}
+	writer, writeCounters := N.UnwrapCountWriter(top, nil)
+	if writer != io.Writer(socket) {
+		t.Fatalf("writer must unwrap to the socket, got %T", writer)
+	}
+	if len(writeCounters) != 1 {
+		t.Fatalf("the stall write counter must survive unwrapping, got %d counters", len(writeCounters))
+	}
+
+	// The counters returned are the stall bookkeeping, not some unrelated pair: the write
+	// counter stamps the write clock and the read counter clears the stall window.
+	tr.tick("a")
+	writeCounters[0](4)
+	clock.Advance(20 * time.Second)
+	tr.tick("a")
+	if tr.size() != 1 || len(tr.stalls) != 1 {
+		t.Fatalf("the write counter must arm the stall clock, stalls=%d", len(tr.stalls))
+	}
+	readCounters[0](4)
+	if !tr.readSeen.Load() {
+		t.Fatal("the read counter must record that the server answered")
+	}
+}
+
+// TestStallClockDrivenThroughBufioCopy is the end-to-end version: real bufio.Copy through the
+// wrapper, no read back, and the stall fires.
+func TestStallClockDrivenThroughBufioCopy(t *testing.T) {
+	clock := newFakeClock()
+	var fired []string
+	cfg := normalizeFailover(optionWith(8*time.Second, 1, 30*time.Second))
+	tr := newStallTracker(cfg, clock.Now, func(tag string) { fired = append(fired, tag) })
+
+	socket, peer := net.Pipe()
+	defer peer.Close()
+	wrapped := tr.wrap(socket, "a")
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		io.Copy(io.Discard, peer) // the peer consumes but never answers
+	}()
+
+	if _, err := bufio.Copy(wrapped, strings.NewReader("request")); err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+	clock.Advance(9 * time.Second)
+	tr.tick("a")
+	if len(fired) != 1 || fired[0] != "a" {
+		t.Fatalf("a write with no answer must stall through bufio.Copy, fired=%v", fired)
+	}
+	wrapped.Close()
+	<-drained
 }

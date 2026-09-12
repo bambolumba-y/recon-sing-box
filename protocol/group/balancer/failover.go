@@ -23,6 +23,7 @@ const (
 	reasonProbeFailed     = "probe_failed"
 	reasonNetworkChange   = "network_change"
 	reasonRescueExhausted = "rescue_exhausted"
+	reasonDialError       = "dial_error"
 )
 
 // prober measures one outbound. The implementation lives in the monitoring package.
@@ -441,10 +442,15 @@ func (f *failover) drainEvents() {
 // consumeEventsLocked drains the strategy event buffer. The caller holds eventsMu.
 func (f *failover) consumeEventsLocked(log bool) {
 	for _, ev := range f.strategy.Events() {
+		// UDP mirrors TCP, so counting both networks would report every switch twice.
+		// Count and log on the same condition: one TCP event, one switch.
+		if ev.Network != N.NetworkTCP {
+			continue
+		}
 		f.switchMu.Lock()
 		f.switches[ev.Reason]++
 		f.switchMu.Unlock()
-		if log && ev.Network == N.NetworkTCP {
+		if log {
 			f.logSwitchLine(ev.From, ev.To, ev.Reason, 0)
 		}
 	}

@@ -20,6 +20,17 @@ type scriptedProber struct {
 	delays map[string]uint16 // missing or 0 => error
 	calls  []string
 	block  map[string]chan struct{} // optional: probe waits until channel closed
+	// clock, when set, is advanced by the cost of every probe: the measured delay on
+	// success, the full timeout on failure. Without it the virtual clock never moves and
+	// every recovery time a scenario reports is 0.
+	clock *fakeClock
+}
+
+// spend advances the attached clock by what the probe cost.
+func (p *scriptedProber) spend(d time.Duration) {
+	if p.clock != nil {
+		p.clock.Advance(d)
+	}
 }
 
 func (p *scriptedProber) Probe(ctx context.Context, tag string, timeout time.Duration) (uint16, error) {
@@ -39,8 +50,10 @@ func (p *scriptedProber) Probe(ctx context.Context, tag string, timeout time.Dur
 		p.mu.Unlock()
 	}
 	if d == 0 {
+		p.spend(timeout)
 		return 0, errors.New("probe failed")
 	}
+	p.spend(time.Duration(d) * time.Millisecond)
 	return d, nil
 }
 
@@ -120,7 +133,7 @@ func newHarness(t *testing.T, tags ...string) (*failover, *LowestDelay, *scripte
 		RescueBatch: 2, RescueTimeout: badoption.Duration(50 * time.Millisecond), ActiveCheckInterval: badoption.Duration(-1),
 	})
 	strategy.setClock(clock.Now)
-	p := &scriptedProber{delays: map[string]uint16{}, block: map[string]chan struct{}{}}
+	p := &scriptedProber{delays: map[string]uint16{}, block: map[string]chan struct{}{}, clock: clock}
 	l := &memLogger{}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
