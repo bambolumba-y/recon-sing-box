@@ -49,10 +49,6 @@ func measured(delay uint16, at time.Time) *adapter.URLTestHistory {
 	return &adapter.URLTestHistory{Time: at, Delay: delay}
 }
 
-func failedHistory(at time.Time) *adapter.URLTestHistory {
-	return &adapter.URLTestHistory{Time: at, Delay: 65535}
-}
-
 type fakeClock struct {
 	mu  sync.Mutex
 	now time.Time

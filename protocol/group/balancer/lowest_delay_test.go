@@ -6,6 +6,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/option"
+	N "github.com/sagernet/sing/common/network"
 )
 
 func newLD(clock *fakeClock, tags ...string) *LowestDelay {
@@ -112,10 +113,55 @@ func TestSuccessfulProbeClearsFailure(t *testing.T) {
 func TestForceSelect(t *testing.T) {
 	c := newFakeClock()
 	s := newLD(c, "a", "b")
-	if !s.ForceSelect("b", "rescue") || s.Now() != "b" {
+	if !s.ForceSelect("b", "rescue", 120) || s.Now() != "b" {
 		t.Fatalf("force select failed, now=%q", s.Now())
 	}
-	if s.ForceSelect("zzz", "rescue") {
+	if !s.Healthy("b") {
+		t.Fatal("a forced tag with a delay must be healthy right away")
+	}
+	if s.ForceSelect("zzz", "rescue", 120) {
 		t.Fatal("unknown tag must be rejected")
+	}
+}
+
+func TestLatencySwitchMovesBothNetworks(t *testing.T) {
+	c := newFakeClock()
+	s := newLD(c, "a", "b")
+	s.UpdateOutboundsInfo(map[string]*adapter.URLTestHistory{"a": measured(200, c.Now()), "b": measured(400, c.Now())})
+	c.Advance(61 * time.Second)
+	s.UpdateOutboundsInfo(map[string]*adapter.URLTestHistory{"a": measured(500, c.Now()), "b": measured(50, c.Now())})
+	if s.Now() != "b" {
+		t.Fatalf("tcp did not switch, now=%q", s.Now())
+	}
+	udp := s.Select(adapter.InboundContext{}, N.NetworkUDP, false)
+	if udp.Tag() != s.Now() {
+		t.Fatalf("udp %q lags behind tcp %q: both networks must move in the same update", udp.Tag(), s.Now())
+	}
+}
+
+func TestConfirmedProvisionalStartsDwellWindow(t *testing.T) {
+	c := newFakeClock()
+	s := newLD(c, "a", "b")
+	// The provisional pick a is confirmed by its own first measurement: dwell starts now.
+	s.UpdateOutboundsInfo(map[string]*adapter.URLTestHistory{"a": measured(200, c.Now()), "b": measured(400, c.Now())})
+	c.Advance(30 * time.Second)
+	s.UpdateOutboundsInfo(map[string]*adapter.URLTestHistory{"a": measured(500, c.Now()), "b": measured(50, c.Now())})
+	if s.Now() != "a" {
+		t.Fatalf("dwell must run from the confirmation, not from the zero time, got %q", s.Now())
+	}
+	c.Advance(31 * time.Second)
+	s.UpdateOutboundsInfo(map[string]*adapter.URLTestHistory{"a": measured(500, c.Now()), "b": measured(50, c.Now())})
+	if s.Now() != "b" {
+		t.Fatalf("after 60s the better server must be selected, got %q", s.Now())
+	}
+}
+
+func TestMarkFailedOnNonCurrentTagHasNothingToRescue(t *testing.T) {
+	c := newFakeClock()
+	s := newLD(c, "a", "b")
+	s.UpdateOutboundsInfo(map[string]*adapter.URLTestHistory{"a": measured(100, c.Now()), "b": measured(200, c.Now())})
+	switched, has := s.MarkFailed("b", "dial_error")
+	if switched || !has || s.Now() != "a" {
+		t.Fatalf("failure of a non-current tag: switched=%v has=%v now=%q", switched, has, s.Now())
 	}
 }

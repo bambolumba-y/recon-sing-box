@@ -89,8 +89,7 @@ func (s *LowestDelay) measuredLocked(tag string) (uint16, bool) {
 }
 
 func (s *LowestDelay) healthyLocked(tag string) bool {
-	d, ok := s.measuredLocked(tag)
-	if !ok || d == 0 {
+	if _, ok := s.measuredLocked(tag); !ok {
 		return false
 	}
 	if at, failed := s.failedAt[tag]; failed && !s.history[tag].Time.After(at) {
@@ -149,6 +148,12 @@ func (s *LowestDelay) UpdateOutboundsInfo(history map[string]*adapter.URLTestHis
 	}
 	changed := false
 	now := s.now()
+	// The dwell decision is taken once for the whole update: switchLocked moves lastSwitch
+	// on the TCP iteration, and without a snapshot UDP would stay behind for a full dwell.
+	dwellOK := now.Sub(s.lastSwitch) >= s.cfg.minDwell
+	// Same reason: the TCP iteration clears provisional, UDP must still see the state
+	// the update started from.
+	wasProvisional := s.provisional
 	for _, network := range []string{N.NetworkTCP, N.NetworkUDP} {
 		cur := s.selected[network]
 		best, bestDelay := s.bestLocked(network, "")
@@ -156,11 +161,11 @@ func (s *LowestDelay) UpdateOutboundsInfo(history map[string]*adapter.URLTestHis
 			continue
 		}
 		switch {
-		case s.provisional || !s.healthyLocked(cur.Tag()):
+		case wasProvisional || !s.healthyLocked(cur.Tag()):
 			if best.Tag() != cur.Tag() {
 				reason := "probe_failed"
-				if s.provisional {
-					reason = "first_measurement"
+				if wasProvisional {
+					reason = "initial"
 				}
 				s.switchLocked(network, best, reason)
 				changed = true
@@ -172,7 +177,7 @@ func (s *LowestDelay) UpdateOutboundsInfo(history map[string]*adapter.URLTestHis
 			}
 		default:
 			curDelay, _ := s.measuredLocked(cur.Tag())
-			if uint32(bestDelay)+uint32(s.cfg.tolerance) < uint32(curDelay) && now.Sub(s.lastSwitch) >= s.cfg.minDwell {
+			if uint32(bestDelay)+uint32(s.cfg.tolerance) < uint32(curDelay) && dwellOK {
 				s.switchLocked(network, best, "better_latency")
 				changed = true
 			}
@@ -181,17 +186,21 @@ func (s *LowestDelay) UpdateOutboundsInfo(history map[string]*adapter.URLTestHis
 	return changed
 }
 
-// MarkFailed records a failure signal for tag. If tag is the current selection, it switches to the best
-// healthy candidate right away. hasCandidate=false tells the caller to start a rescue scan.
+// MarkFailed records a failure signal for tag. Three outcomes:
+//   - (true, true)   tag was the current selection and was replaced by a healthy candidate;
+//   - (false, false) tag was the current selection and nothing healthy is left: start a rescue scan;
+//   - (false, true)  tag was not the current selection, so there is nothing to rescue.
 func (s *LowestDelay) MarkFailed(tag, reason string) (switched bool, hasCandidate bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.failedAt[tag] = s.now()
+	current := false
 	for _, network := range []string{N.NetworkTCP, N.NetworkUDP} {
 		cur := s.selected[network]
 		if cur == nil || cur.Tag() != tag {
 			continue
 		}
+		current = true
 		best, _ := s.bestLocked(network, tag)
 		if best == nil {
 			continue
@@ -200,11 +209,16 @@ func (s *LowestDelay) MarkFailed(tag, reason string) (switched bool, hasCandidat
 		s.switchLocked(network, best, reason)
 		switched = true
 	}
+	if !current {
+		return false, true
+	}
 	return switched, hasCandidate
 }
 
-// ForceSelect selects tag for both networks (rescue result or manual pick). The tag is treated as alive.
-func (s *LowestDelay) ForceSelect(tag, reason string) bool {
+// ForceSelect selects tag for both networks (rescue result or manual pick). The failure mark is
+// cleared; a delay > 0 also stores it as a fresh measurement, so the tag is healthy right away and
+// the next UpdateOutboundsInfo does not move off it. A delay of 0 only clears the mark.
+func (s *LowestDelay) ForceSelect(tag, reason string, delay uint16) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	o, ok := s.byTag[tag]
@@ -212,6 +226,9 @@ func (s *LowestDelay) ForceSelect(tag, reason string) bool {
 		return false
 	}
 	delete(s.failedAt, tag)
+	if delay > 0 {
+		s.history[tag] = &adapter.URLTestHistory{Time: s.now(), Delay: delay}
+	}
 	for _, network := range []string{N.NetworkTCP, N.NetworkUDP} {
 		s.switchLocked(network, o, reason)
 	}
