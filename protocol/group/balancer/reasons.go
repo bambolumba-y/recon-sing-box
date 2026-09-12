@@ -11,13 +11,15 @@ package balancer
 //	network_change   the interface changed and the probe of the current server failed
 //	rescue_exhausted a full rescue scan found no reachable server
 //	manual           reserved: a selection made by the user, not by the controller
+//	better_throughput a full measurement round found a server faster by more than the hysteresis
 const (
-	reasonInitial         = "initial"
-	reasonBetterLatency   = "better_latency"
-	reasonDialError       = "dial_error"
-	reasonStall           = "stall"
-	reasonProbeFailed     = "probe_failed"
-	reasonNetworkChange   = "network_change"
-	reasonRescueExhausted = "rescue_exhausted"
-	reasonManual          = "manual"
+	reasonInitial          = "initial"
+	reasonBetterLatency    = "better_latency"
+	reasonDialError        = "dial_error"
+	reasonStall            = "stall"
+	reasonProbeFailed      = "probe_failed"
+	reasonNetworkChange    = "network_change"
+	reasonRescueExhausted  = "rescue_exhausted"
+	reasonManual           = "manual"
+	reasonBetterThroughput = "better_throughput"
 )

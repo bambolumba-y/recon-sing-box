@@ -35,6 +35,7 @@ const (
 	StrategyConsistentHashing = "consistent-hashing"
 	StrategyStickySessions    = "sticky-sessions"
 	StrategyLowestDelay       = "lowest-delay"
+	StrategyThroughput        = "throughput"
 )
 
 type Balancer struct {

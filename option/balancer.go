@@ -19,4 +19,14 @@ type BalancerOutboundOptions struct {
 	RescueBatch         int                `json:"rescue_batch,omitempty"`
 	RescueTimeout       badoption.Duration `json:"rescue_timeout,omitempty"`
 	ActiveCheckInterval badoption.Duration `json:"active_check_interval,omitempty"` // negative disables
+
+	// Recon throughput (throughput strategy only). Zero means default, negative disables where
+	// noted. All seven travel with the balancer outbound, so the core sets them per balancer.
+	ThroughputTestURL           string             `json:"throughput_test_url,omitempty"`
+	ThroughputProbeBytes        int64              `json:"throughput_probe_bytes,omitempty"`
+	ThroughputRecheckInterval   badoption.Duration `json:"throughput_recheck_interval,omitempty"` // negative disables
+	ThroughputDailyBudgetMB     int64              `json:"throughput_daily_budget_mb,omitempty"`  // negative disables measurement
+	ThroughputShortlist         int                `json:"throughput_shortlist,omitempty"`
+	ThroughputHysteresisPercent int                `json:"throughput_hysteresis_percent,omitempty"`
+	ThroughputMinDwell          badoption.Duration `json:"throughput_min_dwell,omitempty"`
 }
