@@ -3,6 +3,7 @@ package balancer
 import (
 	"context"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -17,13 +18,17 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
+	"github.com/sagernet/sing/service/pause"
 )
 
 func RegisterLoadBalance(registry *outbound.Registry) {
 	outbound.Register[option.BalancerOutboundOptions](registry, C.TypeBalancer, NewLoadBalance)
 }
 
-var _ adapter.OutboundGroup = (*Balancer)(nil)
+var (
+	_ adapter.OutboundGroup           = (*Balancer)(nil)
+	_ adapter.InterfaceUpdateListener = (*Balancer)(nil)
+)
 
 const (
 	StrategyRoundRobin        = "round-robin"
@@ -53,6 +58,23 @@ type Balancer struct {
 	availbleOutbounds []adapter.Outbound
 	close             chan struct{}
 	interruptGroup    *interrupt.Group
+
+	// failover and stalls are nil unless the strategy is lowest-delay; every call site is
+	// nil-guarded so the other strategies keep their previous behaviour.
+	failover  *failover
+	stalls    *stallTracker
+	closeOnce sync.Once
+}
+
+// monitorProber adapts the outbound monitoring to the prober the failover controller needs.
+type monitorProber struct{ m *monitoring.OutboundMonitoring }
+
+func (p monitorProber) Probe(ctx context.Context, tag string, timeout time.Duration) (uint16, error) {
+	his, err := p.m.TestAndWait(ctx, tag, timeout)
+	if err != nil {
+		return 0, err
+	}
+	return his.Delay, nil
 }
 
 func NewLoadBalance(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.BalancerOutboundOptions) (adapter.Outbound, error) {
@@ -68,6 +90,7 @@ func NewLoadBalance(ctx context.Context, router adapter.Router, logger log.Conte
 		interruptExternalConnections: options.InterruptExistConnections,
 		options:                      options,
 		interruptGroup:               interrupt.NewGroup(),
+		close:                        make(chan struct{}),
 	}
 	if len(outbound.tags) == 0 {
 		return nil, E.New("missing tags")
@@ -104,13 +127,51 @@ func (s *Balancer) Start() error {
 		return E.New("unknown load balance strategy: ", s.options.Strategy)
 	}
 
+	if s.options.Strategy == StrategyLowestDelay {
+		ld := s.strategyFn.(*LowestDelay)
+		s.stalls = newStallTracker(ld.cfg, time.Now, func(tag string) {
+			// reportFailure owns the Stalls counter; do not bump it here.
+			s.failover.reportFailure(tag, reasonStall)
+		})
+		s.failover = newFailover(s.ctx, ld.cfg, ld, monitorProber{s.monitor}, s.logger, func() {
+			s.interruptGroup.Interrupt(s.interruptExternalConnections)
+		})
+		s.failover.setResetStalls(s.stalls.reset)
+		if pm := service.FromContext[pause.Manager](s.ctx); pm != nil {
+			s.failover.setPaused(pm.IsDevicePaused)
+		}
+	}
+
 	return nil
 }
 
 func (s *Balancer) PostStart() error {
 	go s.worker()
+	if s.failover != nil {
+		s.failover.start()
+		go s.stallLoop()
+	}
 
 	return nil
+}
+
+// stallLoop drives the stall detector. The tick is cheap: it only walks the tracker when there
+// are wrapped connections.
+func (s *Balancer) stallLoop() {
+	ticker := time.NewTicker(stallTick)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.close:
+			return
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+			if s.stalls.size() > 0 {
+				s.stalls.tick(s.strategyFn.Now())
+			}
+		}
+	}
 }
 
 func (s *Balancer) worker() {
@@ -134,16 +195,33 @@ func (s *Balancer) worker() {
 			}
 			outbounds := s.monitor.OutboundsHistory(s.Tag())
 			if s.strategyFn.UpdateOutboundsInfo(outbounds) {
+				if s.failover != nil {
+					s.failover.drainEvents()
+				}
 				s.interruptGroup.Interrupt(s.interruptExternalConnections)
 			}
 
 		}
 	}
 }
-func (s *Balancer) Close() error {
-	if s.close != nil {
-		close(s.close)
+// InterfaceUpdated implements [adapter.InterfaceUpdateListener].
+func (s *Balancer) InterfaceUpdated() {
+	if s.failover != nil {
+		s.failover.onInterfaceChange()
 	}
+}
+
+func (s *Balancer) Close() error {
+	s.closeOnce.Do(func() {
+		// Close the channel first so worker and stallLoop leave, then stop the controller:
+		// stop waits for its own goroutines, including a rescue scan in flight.
+		if s.close != nil {
+			close(s.close)
+		}
+		if s.failover != nil {
+			s.failover.stop()
+		}
+	})
 	return nil
 }
 
@@ -173,10 +251,16 @@ func (s *Balancer) DialContext(ctx context.Context, network string, destination 
 
 	conn, err := outbound.DialContext(ctx, network, destination)
 	if err == nil {
+		if s.stalls != nil {
+			conn = s.stalls.wrap(conn, outbound.Tag())
+		}
 		return s.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
 	s.monitor.InvalidateTest(outbound.Tag())
+	if s.failover != nil {
+		s.failover.reportFailure(outbound.Tag(), "dial_error")
+	}
 
 	return nil, err
 }
